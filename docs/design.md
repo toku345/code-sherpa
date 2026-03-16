@@ -83,7 +83,8 @@ def run_agent(prompt: str, timeout: int = 300, **kwargs) -> str:
     except subprocess.TimeoutExpired as e:
         raise RuntimeError("agent_timeout") from e
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"agent_failed: {e.stderr}") from e
+        detail = (e.stderr or e.stdout or "").strip()
+        raise RuntimeError(f"agent_failed: {detail}") from e
     return result.stdout
 ```
 
