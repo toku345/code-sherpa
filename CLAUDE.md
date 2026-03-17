@@ -12,3 +12,4 @@ uv run main.py    # 実行
 ## ドキュメント
 
 - `docs/design.md` - アーキテクチャ・技術選択・ハーネス計画の設計ドキュメント
+- `docs/decisions/` - ADR（Architecture Decision Records）。命名規則: `{NNN}-{kebab-case}.md`
