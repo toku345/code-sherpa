@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# bwrap sandbox remnants
+.bash_profile
+.bashrc
+.gitconfig
+.mcp.json
+.profile
+.ripgreprc
+.zprofile
+.zshrc
+.netrc
+.npmrc
+id_ed25519
+id_rsa
+
+# IDE / Editor
+.idea
+.vscode
+
+# Claude Code
+.claude/
