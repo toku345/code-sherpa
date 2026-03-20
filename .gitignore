@@ -220,5 +220,12 @@ __marimo__/
 /id_ed25519
 /id_rsa
 
-# Claude Code
-/.claude/
+# Pipeline logs
+/logs/
+
+# Git worktrees
+/.worktrees/
+
+# Claude Code (settings.json is project-shared per ADR-004)
+/.claude/*
+!/.claude/settings.json
