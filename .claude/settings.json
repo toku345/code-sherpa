@@ -2,11 +2,13 @@
   "sandbox": {
     "enabled": true,
     "allowUnsandboxedCommands": false,
+    "excludedCommands": ["gh", "codex"],
     "network": {
       "allowedDomains": [
         "api.anthropic.com",
         "*.anthropic.com",
         "github.com",
+        "api.github.com",
         "*.githubusercontent.com",
         "*.npmjs.org",
         "pypi.org",
