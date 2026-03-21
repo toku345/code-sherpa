@@ -20,9 +20,10 @@ UV_CACHE_DIR="$TMPDIR/uv-cache" uv run pytest
 ## 検証コマンド
 
 ```bash
-uv run ruff check .        # リンター
-uv run mypy --strict .     # 型チェック
-uv run pytest              # テスト
+uv run ruff format --check .  # フォーマット確認
+uv run ruff check .           # リンター
+uv run mypy --strict .        # 型チェック
+uv run pytest                 # テスト
 ```
 
 ## パイプライン実行

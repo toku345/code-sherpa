@@ -195,9 +195,7 @@ def _mock_subprocess(
 
 class TestFetchIssue:
     @patch("pipeline.run_cmd")
-    def test_populates_context(
-        self, mock_run: Any, ctx: PipelineContext
-    ) -> None:
+    def test_populates_context(self, mock_run: Any, ctx: PipelineContext) -> None:
         from pipeline import fetch_issue
 
         mock_run.return_value = json.dumps(
@@ -211,9 +209,7 @@ class TestFetchIssue:
     def test_null_body(self, mock_run: Any, ctx: PipelineContext) -> None:
         from pipeline import fetch_issue
 
-        mock_run.return_value = json.dumps(
-            {"title": "No body", "body": None}
-        )
+        mock_run.return_value = json.dumps({"title": "No body", "body": None})
         fetch_issue(ctx)
         assert ctx.issue_body == ""
 
@@ -284,9 +280,7 @@ class TestImplement:
 
 class TestRunTests:
     @patch("pipeline.run_cmd")
-    def test_runs_three_commands(
-        self, mock_cmd: Any, ctx: PipelineContext
-    ) -> None:
+    def test_runs_three_commands(self, mock_cmd: Any, ctx: PipelineContext) -> None:
         from pipeline import run_tests
 
         ctx.worktree_path = "/tmp/wt"
@@ -297,9 +291,7 @@ class TestRunTests:
 
 class TestCommitChanges:
     @patch("pipeline.run_cmd")
-    def test_runs_git_commands(
-        self, mock_cmd: Any, ctx: PipelineContext
-    ) -> None:
+    def test_runs_git_commands(self, mock_cmd: Any, ctx: PipelineContext) -> None:
         from pipeline import commit_changes
 
         ctx.issue_number = 42

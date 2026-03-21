@@ -57,46 +57,71 @@ class PipelineContext:
 
 
 def run_cmd(
-    cmd: list[str], cwd: str | None = None, timeout: int = 120,
+    cmd: list[str],
+    cwd: str | None = None,
+    timeout: int = 120,
 ) -> str:
     return subprocess.run(
-        cmd, capture_output=True, text=True, check=True,
-        timeout=timeout, cwd=cwd).stdout.strip()
+        cmd, capture_output=True, text=True, check=True, timeout=timeout, cwd=cwd
+    ).stdout.strip()
 
 
 def run_agent(
-    prompt: str, allowed_tools: str,
-    timeout: int = 300, cwd: str | None = None,
+    prompt: str,
+    allowed_tools: str,
+    timeout: int = 300,
+    cwd: str | None = None,
 ) -> str:
     cmd = [
-        "claude", "-p", "--output-format", "json", "--max-turns", "50",
-        "--dangerously-skip-permissions", "--allowedTools", allowed_tools,
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--max-turns",
+        "50",
+        "--dangerously-skip-permissions",
+        "--allowedTools",
+        allowed_tools,
     ]
-    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                       check=True, timeout=timeout, cwd=cwd)
+    r = subprocess.run(
+        cmd,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=timeout,
+        cwd=cwd,
+    )
     return str(json.loads(r.stdout)["result"])
 
 
 def load_prompt(
-    template: str, _prompts_dir: Path | None = None, **variables: str,
+    template: str,
+    _prompts_dir: Path | None = None,
+    **variables: str,
 ) -> str:
     prompts_dir = _prompts_dir or Path("docs/prompts")
     return (prompts_dir / template).read_text().format_map(variables)
 
 
 def emit_log(
-    results: list[StageResult], issue_number: int,
+    results: list[StageResult],
+    issue_number: int,
     _logs_dir: Path | None = None,
 ) -> None:
     logs_dir = _logs_dir or Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     with (logs_dir / f"issue-{issue_number}.jsonl").open("a") as f:
         for r in results:
-            rec = {"stage": r.stage.value, "status": r.status,
-                   "input_summary": r.input_summary,
-                   "output_summary": r.output_summary, "error": r.error,
-                   "duration_seconds": r.duration_seconds,
-                   "timestamp": r.timestamp}
+            rec = {
+                "stage": r.stage.value,
+                "status": r.status,
+                "input_summary": r.input_summary,
+                "output_summary": r.output_summary,
+                "error": r.error,
+                "duration_seconds": r.duration_seconds,
+                "timestamp": r.timestamp,
+            }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
@@ -112,7 +137,10 @@ def _summarize(ctx: PipelineContext, stage: Stage) -> str:
 
 
 def timed_stage(
-    stage: Stage, func: object, ctx: PipelineContext, input_summary: str,
+    stage: Stage,
+    func: object,
+    ctx: PipelineContext,
+    input_summary: str,
 ) -> StageResult:
     start = time.monotonic()
     ts = datetime.now(UTC).isoformat()
@@ -124,33 +152,59 @@ def timed_stage(
         status, err = "failure", str(exc)
         ctx.last_error = err
     return StageResult(
-        stage=stage, status=status, input_summary=input_summary,
-        output_summary=output, error=err,
-        duration_seconds=round(time.monotonic() - start, 2), timestamp=ts,
+        stage=stage,
+        status=status,
+        input_summary=input_summary,
+        output_summary=output,
+        error=err,
+        duration_seconds=round(time.monotonic() - start, 2),
+        timestamp=ts,
     )
 
 
 def fetch_issue(ctx: PipelineContext) -> None:
-    data = json.loads(run_cmd([
-        "gh", "issue", "view", str(ctx.issue_number),
-        "--repo", ctx.repo, "--json", "title,body"]))
+    data = json.loads(
+        run_cmd(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(ctx.issue_number),
+                "--repo",
+                ctx.repo,
+                "--json",
+                "title,body",
+            ]
+        )
+    )
     ctx.issue_title = data["title"]
     ctx.issue_body = data["body"] or ""
 
 
 def create_plan(ctx: PipelineContext) -> None:
-    ctx.plan = run_agent(load_prompt(
-        "plan.md", issue_number=str(ctx.issue_number),
-        issue_title=ctx.issue_title, issue_body=ctx.issue_body,
-        repo_structure=run_cmd(["git", "ls-files"]),
-    ), allowed_tools=READONLY_TOOLS, timeout=600)
+    ctx.plan = run_agent(
+        load_prompt(
+            "plan.md",
+            issue_number=str(ctx.issue_number),
+            issue_title=ctx.issue_title,
+            issue_body=ctx.issue_body,
+            repo_structure=run_cmd(["git", "ls-files"]),
+        ),
+        allowed_tools=READONLY_TOOLS,
+        timeout=600,
+    )
 
 
 def review_plan(ctx: PipelineContext) -> None:
-    output = run_agent(load_prompt(
-        "plan-review.md", plan=ctx.plan,
-        issue_number=str(ctx.issue_number), issue_title=ctx.issue_title,
-    ), allowed_tools=READONLY_TOOLS)
+    output = run_agent(
+        load_prompt(
+            "plan-review.md",
+            plan=ctx.plan,
+            issue_number=str(ctx.issue_number),
+            issue_title=ctx.issue_title,
+        ),
+        allowed_tools=READONLY_TOOLS,
+    )
     if "APPROVE" not in output:
         raise RuntimeError(f"Plan rejected: {output[:500]}")
 
@@ -166,7 +220,9 @@ def create_branch(ctx: PipelineContext) -> None:
 def implement(ctx: PipelineContext) -> None:
     run_agent(
         load_prompt("implement.md", plan=ctx.plan, last_error=ctx.last_error),
-        allowed_tools=WRITE_TOOLS, timeout=600, cwd=ctx.worktree_path,
+        allowed_tools=WRITE_TOOLS,
+        timeout=600,
+        cwd=ctx.worktree_path,
     )
 
 
@@ -180,9 +236,11 @@ def run_tests(ctx: PipelineContext) -> None:
 def commit_changes(ctx: PipelineContext) -> None:
     wt = ctx.worktree_path
     run_cmd(["git", "add", "-A"], cwd=wt)
-    msg = (f"feat: implement issue #{ctx.issue_number}\n\n"
-           f"Resolves #{ctx.issue_number}\n\n"
-           "Co-Authored-By: Claude Code <noreply@anthropic.com>")
+    msg = (
+        f"feat: implement issue #{ctx.issue_number}\n\n"
+        f"Resolves #{ctx.issue_number}\n\n"
+        "Co-Authored-By: Claude Code <noreply@anthropic.com>"
+    )
     run_cmd(["git", "commit", "-m", msg], cwd=wt)
 
 
@@ -191,21 +249,35 @@ def smoke_test(ctx: PipelineContext) -> None:
 
 
 def create_pr(ctx: PipelineContext) -> None:
-    run_cmd(["git", "push", "-u", "origin", ctx.branch_name],
-            cwd=ctx.worktree_path)
-    ctx.pr_url = run_cmd([
-        "gh", "pr", "create", "--repo", ctx.repo,
-        "--head", ctx.branch_name, "--title", f"feat: {ctx.issue_title}",
-        "--body", f"Resolves #{ctx.issue_number}\n\n"
-        f"## Summary\n\n{ctx.plan[:500]}"])
+    run_cmd(["git", "push", "-u", "origin", ctx.branch_name], cwd=ctx.worktree_path)
+    ctx.pr_url = run_cmd(
+        [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            ctx.repo,
+            "--head",
+            ctx.branch_name,
+            "--title",
+            f"feat: {ctx.issue_title}",
+            "--body",
+            f"Resolves #{ctx.issue_number}\n\n## Summary\n\n{ctx.plan[:500]}",
+        ]
+    )
 
 
 def code_review(ctx: PipelineContext) -> None:
     diff = run_cmd(["git", "diff", "main...HEAD"], cwd=ctx.worktree_path)
-    output = run_agent(load_prompt(
-        "code-review.md", diff=diff,
-        issue_number=str(ctx.issue_number), issue_title=ctx.issue_title,
-    ), allowed_tools=READONLY_TOOLS)
+    output = run_agent(
+        load_prompt(
+            "code-review.md",
+            diff=diff,
+            issue_number=str(ctx.issue_number),
+            issue_title=ctx.issue_title,
+        ),
+        allowed_tools=READONLY_TOOLS,
+    )
     if "APPROVE" not in output:
         raise RuntimeError(f"Code review rejected: {output[:500]}")
 
@@ -215,8 +287,11 @@ def wait_for_merge(ctx: PipelineContext) -> None:
 
 
 def _run_stage(
-    stage: Stage, func: object, ctx: PipelineContext,
-    input_summary: str, max_attempts: int = 1,
+    stage: Stage,
+    func: object,
+    ctx: PipelineContext,
+    input_summary: str,
+    max_attempts: int = 1,
 ) -> StageResult:
     for attempt in range(1, max_attempts + 1):
         result = timed_stage(stage, func, ctx, input_summary)
@@ -226,7 +301,8 @@ def _run_stage(
             return result
         print(f"[{attempt}/{max_attempts}] {stage.value}: {result.error}")
     raise SystemExit(  # noqa: F821
-        f"Stage {stage.value} failed. Escalating to human.")
+        f"Stage {stage.value} failed. Escalating to human."
+    )
 
 
 def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
@@ -234,10 +310,14 @@ def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
     n = issue_number
     _run_stage(Stage.ISSUE_DETECTION, fetch_issue, ctx, f"issue #{n}")
     for _ in range(MAX_RETRIES):
-        _run_stage(Stage.PLAN_CREATION, create_plan, ctx,
-                   f"#{n}: {ctx.issue_title}", MAX_RETRIES)
-        r = timed_stage(Stage.PLAN_REVIEW, review_plan, ctx,
-                        f"plan for #{n}")
+        _run_stage(
+            Stage.PLAN_CREATION,
+            create_plan,
+            ctx,
+            f"#{n}: {ctx.issue_title}",
+            MAX_RETRIES,
+        )
+        r = timed_stage(Stage.PLAN_REVIEW, review_plan, ctx, f"plan for #{n}")
         ctx.results.append(r)
         emit_log([r], n)
         if r.status == "success":
@@ -245,44 +325,46 @@ def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
         print(f"Plan rejected, regenerating... ({r.error})")
     else:
         raise SystemExit(
-            f"Plan review failed after {MAX_RETRIES} cycles. "
-            "Escalating to human.")
+            f"Plan review failed after {MAX_RETRIES} cycles. Escalating to human."
+        )
     _run_stage(Stage.BRANCH_CREATION, create_branch, ctx, f"branch #{n}")
-    _run_stage(Stage.IMPLEMENTATION, implement, ctx,
-               f"impl #{n}", MAX_RETRIES)
-    _run_stage(Stage.TEST_EXECUTION, run_tests, ctx,
-               "pytest+ruff+mypy", MAX_RETRIES)
+    _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"impl #{n}", MAX_RETRIES)
+    _run_stage(Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy", MAX_RETRIES)
     _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
     _run_stage(Stage.SMOKE_TEST, smoke_test, ctx, "smoke test")
     _run_stage(Stage.PR_CREATION, create_pr, ctx, f"PR for #{n}")
     for _ in range(MAX_RETRIES):
-        r = timed_stage(Stage.CODE_REVIEW, code_review, ctx,
-                        f"review PR #{n}")
+        r = timed_stage(Stage.CODE_REVIEW, code_review, ctx, f"review PR #{n}")
         ctx.results.append(r)
         emit_log([r], n)
         if r.status == "success":
             break
         print(f"Code review rejected, fixing... ({r.error})")
-        _run_stage(Stage.IMPLEMENTATION, implement, ctx,
-                   f"fix #{n}", MAX_RETRIES)
-        _run_stage(Stage.TEST_EXECUTION, run_tests, ctx,
-                   "pytest+ruff+mypy", MAX_RETRIES)
-        _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx,
-                   "git commit")
+        _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"fix #{n}", MAX_RETRIES)
+        _run_stage(
+            Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy", MAX_RETRIES
+        )
+        _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
     else:
         raise SystemExit(
-            f"Code review failed after {MAX_RETRIES} cycles. "
-            "Escalating to human.")
-    _run_stage(Stage.MERGE_DECISION, wait_for_merge, ctx,
-               f"PR: {ctx.pr_url}")
+            f"Code review failed after {MAX_RETRIES} cycles. Escalating to human."
+        )
+    _run_stage(Stage.MERGE_DECISION, wait_for_merge, ctx, f"PR: {ctx.pr_url}")
     return ctx.results
 
 
 def _detect_repo() -> str:
-    return os.environ.get("CODE_SHERPA_REPO") or run_cmd([
-        "gh", "repo", "view", "--json", "nameWithOwner",
-        "-q", ".nameWithOwner",
-    ])
+    return os.environ.get("CODE_SHERPA_REPO") or run_cmd(
+        [
+            "gh",
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ]
+    )
 
 
 def main() -> None:
