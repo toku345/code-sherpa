@@ -1,7 +1,7 @@
 {
   "sandbox": {
     "enabled": true,
-    "allowUnsandboxedCommands": false,
+    "allowUnsandboxedCommands": true,
     "excludedCommands": ["gh", "codex"],
     "network": {
       "allowedDomains": [
