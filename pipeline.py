@@ -7,14 +7,18 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 MAX_RETRIES = 3
 READONLY_TOOLS = "Read,Glob,Grep"
 WRITE_TOOLS = "Read,Write,Edit,Glob,Grep"
+
+StageStatus = Literal["success", "failure"]
 
 
 class Stage(Enum):
@@ -34,7 +38,7 @@ class Stage(Enum):
 @dataclass(frozen=True)
 class StageResult:
     stage: Stage
-    status: str  # "success" | "failure"
+    status: StageStatus
     input_summary: str
     output_summary: str
     error: str | None
@@ -95,6 +99,7 @@ def run_agent(
         "json",
         "--max-turns",
         "50",
+        # allowedTools で実行可能なツールを制限済みのため安全
         "--dangerously-skip-permissions",
         "--allowedTools",
         allowed_tools,
@@ -157,7 +162,10 @@ def emit_log(
 
 
 def _parse_verdict(output: str) -> bool:
-    """Parse VERDICT:APPROVED / VERDICT:REJECTED from the last lines of output."""
+    """Scan output lines from end; return True for VERDICT:APPROVED, False otherwise.
+
+    Raises RuntimeError if no VERDICT: line is found.
+    """
     for line in reversed(output.strip().splitlines()):
         stripped = line.strip()
         if stripped.startswith("VERDICT:"):
@@ -178,15 +186,16 @@ def _summarize(ctx: PipelineContext, stage: Stage) -> str:
 
 def timed_stage(
     stage: Stage,
-    func: object,
+    func: Callable[[PipelineContext], None],
     ctx: PipelineContext,
     input_summary: str,
 ) -> StageResult:
     start = time.monotonic()
     ts = datetime.now(UTC).isoformat()
-    status, output, err = "success", "", None
+    status: StageStatus = "success"
+    output, err = "", None
     try:
-        func(ctx)  # type: ignore[operator]
+        func(ctx)
         output = _summarize(ctx, stage)
     except (FileNotFoundError, KeyError, TypeError):
         raise
@@ -329,6 +338,7 @@ def code_review(ctx: PipelineContext) -> None:
             issue_title=ctx.issue_title,
         ),
         allowed_tools=READONLY_TOOLS,
+        cwd=ctx.worktree_path,
     )
     if not _parse_verdict(output):
         raise RuntimeError(f"Code review rejected: {output[:500]}")
@@ -340,7 +350,7 @@ def wait_for_merge(ctx: PipelineContext) -> None:
 
 def _run_stage(
     stage: Stage,
-    func: object,
+    func: Callable[[PipelineContext], None],
     ctx: PipelineContext,
     input_summary: str,
     max_attempts: int = 1,
@@ -352,9 +362,7 @@ def _run_stage(
         if result.status == "success":
             return result
         print(f"[{attempt}/{max_attempts}] {stage.value}: {result.error}")
-    raise SystemExit(  # noqa: F821
-        f"Stage {stage.value} failed. Escalating to human."
-    )
+    raise SystemExit(f"Stage {stage.value} failed. Escalating to human.")
 
 
 def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
@@ -395,6 +403,7 @@ def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
         _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"fix #{n}")
         _run_stage(Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy")
         _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
+        print(f"Pushing fixes to {ctx.branch_name}...")
         run_cmd(["git", "push"], cwd=ctx.worktree_path)
     else:
         raise SystemExit(
