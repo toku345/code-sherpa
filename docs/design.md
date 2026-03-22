@@ -99,7 +99,7 @@ Shell 直接キック → SDK への移行パスは Python なら摩擦が最小
 
 ### 2.5 セキュリティモデル
 
-code-sherpa のセキュリティは 3 層で構成する。詳細は [ADR-004](./decisions/004-security-architecture.md) を参照。
+code-sherpa のセキュリティは 3 層で構成する（Phase 0）。詳細は [ADR-004](./decisions/004-security-architecture.md) を参照。
 
 | レイヤー | 脅威 | 対策 |
 |----------|------|------|
@@ -108,6 +108,8 @@ code-sherpa のセキュリティは 3 層で構成する。詳細は [ADR-004](
 | パイプライン制御 | 無限ループ、リソース浪費 | リトライ上限 3 回 + 人間エスカレーション |
 
 **重要な設計判断:** コンテナ / microVM での隔離ではなく、Claude Code の built-in sandbox をホスト上で有効にして直接実行する。AI エージェントの主要脅威（prompt injection）に対しては、行動単位の制約（sandbox）の方がプロセス単位の隔離（コンテナ）より的確に機能する。また Max プランでの運用において認証の問題が発生しない。
+
+> **補足:** [ADR-006](./decisions/006-coding-agent-selection.md)（コーディングエージェント選定）では、サンドボックス突破時の被害半径を限定する Layer 4（コンテナ/VM）を加えた 4 層モデルを提示している。Phase 0 では上記 3 層で運用し、Layer 4 の導入は今後の検討事項とする。
 
 
 ## 3. 技術選択
