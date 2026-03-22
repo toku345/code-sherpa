@@ -12,6 +12,7 @@ from pipeline import (
     Stage,
     StageResult,
     _parse_verdict,
+    _run_stage,
     _summarize,
     emit_log,
     load_prompt,
@@ -159,6 +160,13 @@ class TestTimedStage:
         assert result.status == "failure"
         assert result.error == "boom"
         assert ctx.last_error == "boom"
+
+    def test_permanent_error_reraises(self, ctx: PipelineContext) -> None:
+        def fail_permanent(c: PipelineContext) -> None:
+            raise FileNotFoundError("missing template")
+
+        with pytest.raises(FileNotFoundError, match="missing template"):
+            timed_stage(Stage.SMOKE_TEST, fail_permanent, ctx, "test")
 
 
 class TestSummarize:
@@ -458,3 +466,95 @@ class TestRunPipeline:
         mock_plan.side_effect = RuntimeError("agent failed")
         with pytest.raises(SystemExit, match="failed"):
             run_pipeline(1, "owner/repo")
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _run_stage retry logic (T1)
+# ---------------------------------------------------------------------------
+
+
+class TestRunStage:
+    @patch("pipeline.emit_log")
+    def test_success_first_attempt(self, mock_emit: Any, ctx: PipelineContext) -> None:
+        def noop(c: PipelineContext) -> None:
+            pass
+
+        result = _run_stage(Stage.SMOKE_TEST, noop, ctx, "test")
+        assert result.status == "success"
+        assert len(ctx.results) == 1
+
+    @patch("pipeline.emit_log")
+    def test_retry_then_success(self, mock_emit: Any, ctx: PipelineContext) -> None:
+        call_count = 0
+
+        def fail_once(c: PipelineContext) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("transient")
+
+        result = _run_stage(Stage.SMOKE_TEST, fail_once, ctx, "test", max_attempts=2)
+        assert result.status == "success"
+        assert len(ctx.results) == 2
+
+    @patch("pipeline.emit_log")
+    def test_max_attempts_exits(self, mock_emit: Any, ctx: PipelineContext) -> None:
+        def always_fail(c: PipelineContext) -> None:
+            raise RuntimeError("persistent")
+
+        with pytest.raises(SystemExit, match="failed"):
+            _run_stage(Stage.SMOKE_TEST, always_fail, ctx, "test", max_attempts=2)
+        assert len(ctx.results) == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: run_agent error handling (T4)
+# ---------------------------------------------------------------------------
+
+
+class TestRunAgentParsing:
+    @patch("subprocess.run")
+    def test_invalid_json_raises(self, mock_run: Any) -> None:
+        from pipeline import run_agent
+
+        mock_run.return_value = type("R", (), {"stdout": "not json", "returncode": 0})()
+        with pytest.raises(RuntimeError, match="invalid JSON"):
+            run_agent("prompt", allowed_tools="Read")
+
+    @patch("subprocess.run")
+    def test_missing_result_key_raises(self, mock_run: Any) -> None:
+        from pipeline import run_agent
+
+        mock_run.return_value = type(
+            "R", (), {"stdout": '{"output": "no result key"}', "returncode": 0}
+        )()
+        with pytest.raises(RuntimeError, match="missing 'result' key"):
+            run_agent("prompt", allowed_tools="Read")
+
+    @patch("subprocess.run")
+    def test_timeout_raises(self, mock_run: Any) -> None:
+        import subprocess as sp
+
+        from pipeline import run_agent
+
+        mock_run.side_effect = sp.TimeoutExpired(cmd=["claude"], timeout=300)
+        with pytest.raises(RuntimeError, match="timed out"):
+            run_agent("prompt", allowed_tools="Read")
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: load_prompt with braces in content (C1 verification)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadPromptBraces:
+    def test_diff_with_braces_does_not_crash(self, tmp_path: Path) -> None:
+        tpl = tmp_path / "review.md"
+        tpl.write_text("Review: {diff}\n")
+        result = load_prompt(
+            "review.md",
+            _prompts_dir=tmp_path,
+            diff="function foo() { return {bar: 1}; }",
+        )
+        assert "function foo()" in result
+        assert "{bar: 1}" in result

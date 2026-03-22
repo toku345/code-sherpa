@@ -18,6 +18,7 @@ MAX_RETRIES = 3
 READONLY_TOOLS = "Read,Glob,Grep"
 WRITE_TOOLS = "Read,Write,Edit,Glob,Grep"
 
+
 StageStatus = Literal["success", "failure"]
 
 
@@ -71,6 +72,7 @@ def run_cmd(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
             timeout=timeout,
             cwd=cwd,
@@ -110,6 +112,7 @@ def run_agent(
             input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
             timeout=timeout,
             cwd=cwd,
@@ -134,7 +137,7 @@ def load_prompt(
     **variables: str,
 ) -> str:
     prompts_dir = _prompts_dir or Path("docs/prompts")
-    text = (prompts_dir / template).read_text()
+    text = (prompts_dir / template).read_text(encoding="utf-8")
     for key, value in variables.items():
         text = text.replace(f"{{{key}}}", value)
     return text
@@ -147,7 +150,7 @@ def emit_log(
 ) -> None:
     logs_dir = _logs_dir or Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
-    with (logs_dir / f"issue-{issue_number}.jsonl").open("a") as f:
+    with (logs_dir / f"issue-{issue_number}.jsonl").open("a", encoding="utf-8") as f:
         for r in results:
             rec = {
                 "stage": r.stage.value,
@@ -184,6 +187,9 @@ def _summarize(ctx: PipelineContext, stage: Stage) -> str:
     return table.get(stage, "done")
 
 
+_PERMANENT_ERRORS = (FileNotFoundError, KeyError, TypeError)
+
+
 def timed_stage(
     stage: Stage,
     func: Callable[[PipelineContext], None],
@@ -197,7 +203,7 @@ def timed_stage(
     try:
         func(ctx)
         output = _summarize(ctx, stage)
-    except (FileNotFoundError, KeyError, TypeError):
+    except _PERMANENT_ERRORS:
         raise
     except Exception as exc:
         status, err = "failure", str(exc)
