@@ -61,9 +61,19 @@ def run_cmd(
     cwd: str | None = None,
     timeout: int = 120,
 ) -> str:
-    return subprocess.run(
-        cmd, capture_output=True, text=True, check=True, timeout=timeout, cwd=cwd
-    ).stdout.strip()
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(details) from exc
+    return completed.stdout.strip()
 
 
 def run_agent(
@@ -83,15 +93,19 @@ def run_agent(
         "--allowedTools",
         allowed_tools,
     ]
-    r = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=timeout,
-        cwd=cwd,
-    )
+    try:
+        r = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(details) from exc
     return str(json.loads(r.stdout)["result"])
 
 
@@ -123,6 +137,15 @@ def emit_log(
                 "timestamp": r.timestamp,
             }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _parse_verdict(output: str) -> bool:
+    """Parse VERDICT:APPROVED / VERDICT:REJECTED from the last lines of output."""
+    for line in reversed(output.strip().splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("VERDICT:"):
+            return stripped == "VERDICT:APPROVED"
+    raise RuntimeError(f"No VERDICT line found in output: {output[:500]}")
 
 
 def _summarize(ctx: PipelineContext, stage: Stage) -> str:
@@ -205,14 +228,15 @@ def review_plan(ctx: PipelineContext) -> None:
         ),
         allowed_tools=READONLY_TOOLS,
     )
-    if "APPROVE" not in output:
+    if not _parse_verdict(output):
         raise RuntimeError(f"Plan rejected: {output[:500]}")
 
 
 def create_branch(ctx: PipelineContext) -> None:
     branch = f"issue-{ctx.issue_number}"
     wt = str(Path(f".worktrees/{branch}").resolve())
-    run_cmd(["git", "worktree", "add", "-b", branch, wt, "main"])
+    run_cmd(["git", "fetch", "origin", "main"])
+    run_cmd(["git", "worktree", "add", "-b", branch, wt, "origin/main"])
     ctx.branch_name = branch
     ctx.worktree_path = wt
 
@@ -236,6 +260,8 @@ def run_tests(ctx: PipelineContext) -> None:
 def commit_changes(ctx: PipelineContext) -> None:
     wt = ctx.worktree_path
     run_cmd(["git", "add", "-A"], cwd=wt)
+    if not run_cmd(["git", "status", "--porcelain"], cwd=wt):
+        raise RuntimeError("No changes to commit")
     msg = (
         f"feat: implement issue #{ctx.issue_number}\n\n"
         f"Resolves #{ctx.issue_number}\n\n"
@@ -268,7 +294,7 @@ def create_pr(ctx: PipelineContext) -> None:
 
 
 def code_review(ctx: PipelineContext) -> None:
-    diff = run_cmd(["git", "diff", "main...HEAD"], cwd=ctx.worktree_path)
+    diff = run_cmd(["git", "diff", "origin/main...HEAD"], cwd=ctx.worktree_path)
     output = run_agent(
         load_prompt(
             "code-review.md",
@@ -278,7 +304,7 @@ def code_review(ctx: PipelineContext) -> None:
         ),
         allowed_tools=READONLY_TOOLS,
     )
-    if "APPROVE" not in output:
+    if not _parse_verdict(output):
         raise RuntimeError(f"Code review rejected: {output[:500]}")
 
 
@@ -345,6 +371,7 @@ def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
             Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy", MAX_RETRIES
         )
         _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
+        run_cmd(["git", "push"], cwd=ctx.worktree_path)
     else:
         raise SystemExit(
             f"Code review failed after {MAX_RETRIES} cycles. Escalating to human."

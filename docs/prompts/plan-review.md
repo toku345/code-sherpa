@@ -18,5 +18,6 @@ Review the following implementation plan for Issue #{issue_number}: {issue_title
 ## Output format
 
 - List any issues found, each on its own line.
-- If the plan is acceptable, output exactly `APPROVE` on its own line at the end.
-- If the plan has critical issues, output `REJECT` on its own line at the end, followed by a brief explanation.
+- End your response with exactly one of the following verdict lines:
+  - `VERDICT:APPROVED` — if the plan is acceptable.
+  - `VERDICT:REJECTED` — if the plan has critical issues, preceded by a brief explanation.

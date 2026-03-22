@@ -20,5 +20,6 @@ Review the following diff for Issue #{issue_number}: {issue_title}.
 ## Output format
 
 - List any issues found, each on its own line.
-- If the code is acceptable, output exactly `APPROVE` on its own line at the end.
-- If the code has critical issues, output `REJECT` on its own line at the end, followed by a brief explanation.
+- End your response with exactly one of the following verdict lines:
+  - `VERDICT:APPROVED` — if the code is acceptable.
+  - `VERDICT:REJECTED` — if the code has critical issues, preceded by a brief explanation.
