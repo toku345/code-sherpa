@@ -101,9 +101,9 @@ class TestLoadPrompt:
         )
         assert result == "Hello Alice, issue #7"
 
-    def test_missing_var_raises(self, tmp_prompts: Path) -> None:
-        with pytest.raises(KeyError):
-            load_prompt("test.md", _prompts_dir=tmp_prompts, name="Alice")
+    def test_missing_var_left_as_placeholder(self, tmp_prompts: Path) -> None:
+        result = load_prompt("test.md", _prompts_dir=tmp_prompts, name="Alice")
+        assert result == "Hello Alice, issue #{num}"
 
 
 class TestEmitLog:

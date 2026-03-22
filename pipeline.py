@@ -60,6 +60,7 @@ def run_cmd(
     cmd: list[str],
     cwd: str | None = None,
     timeout: int = 120,
+    env: dict[str, str] | None = None,
 ) -> str:
     try:
         completed = subprocess.run(
@@ -69,7 +70,12 @@ def run_cmd(
             check=True,
             timeout=timeout,
             cwd=cwd,
+            env=env,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Command timed out after {exc.timeout}s: {exc.cmd}"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         details = (exc.stderr or exc.stdout or str(exc)).strip()
         raise RuntimeError(details) from exc
@@ -103,10 +109,18 @@ def run_agent(
             timeout=timeout,
             cwd=cwd,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Agent timed out after {exc.timeout}s") from exc
     except subprocess.CalledProcessError as exc:
         details = (exc.stderr or exc.stdout or str(exc)).strip()
         raise RuntimeError(details) from exc
-    return str(json.loads(r.stdout)["result"])
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Agent returned invalid JSON: {r.stdout[:200]}") from exc
+    if not isinstance(data, dict) or "result" not in data:
+        raise RuntimeError(f"Agent output missing 'result' key: {r.stdout[:200]}")
+    return str(data["result"])
 
 
 def load_prompt(
@@ -115,7 +129,10 @@ def load_prompt(
     **variables: str,
 ) -> str:
     prompts_dir = _prompts_dir or Path("docs/prompts")
-    return (prompts_dir / template).read_text().format_map(variables)
+    text = (prompts_dir / template).read_text()
+    for key, value in variables.items():
+        text = text.replace(f"{{{key}}}", value)
+    return text
 
 
 def emit_log(
@@ -171,6 +188,8 @@ def timed_stage(
     try:
         func(ctx)  # type: ignore[operator]
         output = _summarize(ctx, stage)
+    except (FileNotFoundError, KeyError, TypeError):
+        raise
     except Exception as exc:
         status, err = "failure", str(exc)
         ctx.last_error = err
@@ -252,9 +271,16 @@ def implement(ctx: PipelineContext) -> None:
 
 def run_tests(ctx: PipelineContext) -> None:
     wt = ctx.worktree_path
-    run_cmd(["uv", "run", "pytest"], cwd=wt, timeout=120)
-    run_cmd(["uv", "run", "ruff", "check", "."], cwd=wt, timeout=60)
-    run_cmd(["uv", "run", "mypy", "--strict", "."], cwd=wt, timeout=120)
+    env = {
+        **os.environ,
+        "UV_CACHE_DIR": os.path.join(
+            os.environ.get("TMPDIR", "/tmp"),
+            "uv-cache",
+        ),
+    }
+    run_cmd(["uv", "run", "pytest"], cwd=wt, timeout=120, env=env)
+    run_cmd(["uv", "run", "ruff", "check", "."], cwd=wt, timeout=60, env=env)
+    run_cmd(["uv", "run", "mypy", "--strict", "."], cwd=wt, timeout=120, env=env)
 
 
 def commit_changes(ctx: PipelineContext) -> None:
@@ -336,16 +362,8 @@ def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
     n = issue_number
     _run_stage(Stage.ISSUE_DETECTION, fetch_issue, ctx, f"issue #{n}")
     for _ in range(MAX_RETRIES):
-        _run_stage(
-            Stage.PLAN_CREATION,
-            create_plan,
-            ctx,
-            f"#{n}: {ctx.issue_title}",
-            MAX_RETRIES,
-        )
-        r = timed_stage(Stage.PLAN_REVIEW, review_plan, ctx, f"plan for #{n}")
-        ctx.results.append(r)
-        emit_log([r], n)
+        _run_stage(Stage.PLAN_CREATION, create_plan, ctx, f"#{n}: {ctx.issue_title}")
+        r = _run_stage(Stage.PLAN_REVIEW, review_plan, ctx, f"plan for #{n}")
         if r.status == "success":
             break
         print(f"Plan rejected, regenerating... ({r.error})")
@@ -354,22 +372,28 @@ def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
             f"Plan review failed after {MAX_RETRIES} cycles. Escalating to human."
         )
     _run_stage(Stage.BRANCH_CREATION, create_branch, ctx, f"branch #{n}")
-    _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"impl #{n}", MAX_RETRIES)
-    _run_stage(Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy", MAX_RETRIES)
+    # Implementation → test loop: re-implement on test failure (design §2.2)
+    _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"impl #{n}")
+    _run_stage(Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy")
+    test_failures = 1 if ctx.results[-1].status == "failure" else 0
+    while ctx.results[-1].status == "failure":
+        if test_failures >= MAX_RETRIES:
+            raise SystemExit(
+                "Test execution failed after retries. Escalating to human."
+            )
+        _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"fix #{n}")
+        _run_stage(Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy")
+        test_failures += 1
     _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
     _run_stage(Stage.SMOKE_TEST, smoke_test, ctx, "smoke test")
     _run_stage(Stage.PR_CREATION, create_pr, ctx, f"PR for #{n}")
     for _ in range(MAX_RETRIES):
-        r = timed_stage(Stage.CODE_REVIEW, code_review, ctx, f"review PR #{n}")
-        ctx.results.append(r)
-        emit_log([r], n)
+        r = _run_stage(Stage.CODE_REVIEW, code_review, ctx, f"review PR #{n}")
         if r.status == "success":
             break
         print(f"Code review rejected, fixing... ({r.error})")
-        _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"fix #{n}", MAX_RETRIES)
-        _run_stage(
-            Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy", MAX_RETRIES
-        )
+        _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"fix #{n}")
+        _run_stage(Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy")
         _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
         run_cmd(["git", "push"], cwd=ctx.worktree_path)
     else:
