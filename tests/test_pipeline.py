@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -12,6 +11,7 @@ from pipeline import (
     PipelineContext,
     Stage,
     StageResult,
+    _parse_verdict,
     _summarize,
     emit_log,
     load_prompt,
@@ -87,7 +87,7 @@ class TestRunCmd:
         assert run_cmd(["echo", "hello"]) == "hello"
 
     def test_failure_raises(self) -> None:
-        with pytest.raises(subprocess.CalledProcessError):
+        with pytest.raises(RuntimeError):
             run_cmd(["false"])
 
 
@@ -174,23 +174,24 @@ class TestSummarize:
         assert _summarize(ctx, Stage.SMOKE_TEST) == "done"
 
 
+class TestParseVerdict:
+    def test_approved(self) -> None:
+        assert _parse_verdict("Looks good.\nVERDICT:APPROVED") is True
+
+    def test_rejected(self) -> None:
+        assert _parse_verdict("Issues found.\nVERDICT:REJECTED") is False
+
+    def test_no_verdict_raises(self) -> None:
+        with pytest.raises(RuntimeError, match="No VERDICT line"):
+            _parse_verdict("Some output without verdict")
+
+    def test_disapprove_not_matched_as_approved(self) -> None:
+        assert _parse_verdict("VERDICT:DISAPPROVED") is False
+
+
 # ---------------------------------------------------------------------------
 # Integration tests: stage functions (subprocess mocked)
 # ---------------------------------------------------------------------------
-
-
-def _mock_subprocess(
-    stdout: str = "",
-    returncode: int = 0,
-) -> Any:
-    """Create a mock for subprocess.run that returns the given stdout."""
-    from unittest.mock import MagicMock
-
-    mock_result = MagicMock()
-    mock_result.stdout = stdout
-    mock_result.stderr = ""
-    mock_result.returncode = returncode
-    return mock_result
 
 
 class TestFetchIssue:
@@ -240,7 +241,7 @@ class TestReviewPlan:
         from pipeline import review_plan
 
         ctx.plan = "my plan"
-        mock_agent.return_value = "Looks good. APPROVE"
+        mock_agent.return_value = "Looks good.\nVERDICT:APPROVED"
         review_plan(ctx)  # should not raise
 
     @patch("pipeline.run_agent")
@@ -248,7 +249,7 @@ class TestReviewPlan:
         from pipeline import review_plan
 
         ctx.plan = "bad plan"
-        mock_agent.return_value = "Missing tests. REJECT"
+        mock_agent.return_value = "Missing tests.\nVERDICT:REJECTED"
         with pytest.raises(RuntimeError, match="Plan rejected"):
             review_plan(ctx)
 
@@ -296,9 +297,25 @@ class TestCommitChanges:
 
         ctx.issue_number = 42
         ctx.worktree_path = "/tmp/wt"
-        mock_cmd.return_value = ""
+        mock_cmd.side_effect = [
+            "",  # git add -A
+            "M pipeline.py",  # git status --porcelain
+            "",  # git commit
+        ]
         commit_changes(ctx)
-        assert mock_cmd.call_count == 2
+        assert mock_cmd.call_count == 3
+
+    @patch("pipeline.run_cmd")
+    def test_no_changes_raises(self, mock_cmd: Any, ctx: PipelineContext) -> None:
+        from pipeline import commit_changes
+
+        ctx.worktree_path = "/tmp/wt"
+        mock_cmd.side_effect = [
+            "",  # git add -A
+            "",  # git status --porcelain (empty = no changes)
+        ]
+        with pytest.raises(RuntimeError, match="No changes to commit"):
+            commit_changes(ctx)
 
 
 class TestSmokeTest:
@@ -338,7 +355,7 @@ class TestCodeReview:
         ctx.worktree_path = "/tmp/wt"
         ctx.issue_title = "Fix"
         mock_cmd.return_value = "diff content"
-        mock_agent.return_value = "LGTM. APPROVE"
+        mock_agent.return_value = "LGTM.\nVERDICT:APPROVED"
         code_review(ctx)
 
     @patch("pipeline.run_agent")
@@ -354,7 +371,7 @@ class TestCodeReview:
         ctx.worktree_path = "/tmp/wt"
         ctx.issue_title = "Fix"
         mock_cmd.return_value = "diff content"
-        mock_agent.return_value = "Bug found. REJECT"
+        mock_agent.return_value = "Bug found.\nVERDICT:REJECTED"
         with pytest.raises(RuntimeError, match="Code review rejected"):
             code_review(ctx)
 
