@@ -558,3 +558,14 @@ class TestLoadPromptBraces:
         )
         assert "function foo()" in result
         assert "{bar: 1}" in result
+
+    def test_value_containing_placeholder_not_reexpanded(self, tmp_path: Path) -> None:
+        tpl = tmp_path / "tpl.md"
+        tpl.write_text("{first} and {second}")
+        result = load_prompt(
+            "tpl.md",
+            _prompts_dir=tmp_path,
+            first="{second}",
+            second="real",
+        )
+        assert result == "{second} and real"

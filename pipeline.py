@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -138,9 +139,11 @@ def load_prompt(
 ) -> str:
     prompts_dir = _prompts_dir or Path("docs/prompts")
     text = (prompts_dir / template).read_text(encoding="utf-8")
-    for key, value in variables.items():
-        text = text.replace(f"{{{key}}}", value)
-    return text
+    return re.sub(
+        r"\{([A-Za-z_][A-Za-z0-9_]*)\}",
+        lambda m: variables.get(m.group(1), m.group(0)),
+        text,
+    )
 
 
 def emit_log(
