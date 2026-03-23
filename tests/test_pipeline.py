@@ -9,6 +9,7 @@ import pytest
 
 from pipeline import (
     PipelineContext,
+    ReviewRejectedError,
     Stage,
     StageResult,
     _parse_verdict,
@@ -178,6 +179,13 @@ class TestTimedStage:
         with pytest.raises(FileNotFoundError, match="missing template"):
             timed_stage(Stage.SMOKE_TEST, fail_permanent, ctx, "test")
 
+    def test_review_rejected_reraises(self, ctx: PipelineContext) -> None:
+        def reject(c: PipelineContext) -> None:
+            raise ReviewRejectedError("rejected by reviewer")
+
+        with pytest.raises(ReviewRejectedError, match="rejected by reviewer"):
+            timed_stage(Stage.PLAN_REVIEW, reject, ctx, "test")
+
 
 class TestSummarize:
     def test_issue_detection(self, ctx: PipelineContext) -> None:
@@ -268,7 +276,7 @@ class TestReviewPlan:
 
         ctx.plan = "bad plan"
         mock_agent.return_value = "Missing tests.\nVERDICT:REJECTED"
-        with pytest.raises(RuntimeError, match="Plan rejected"):
+        with pytest.raises(ReviewRejectedError, match="Plan rejected"):
             review_plan(ctx)
 
 
@@ -390,7 +398,7 @@ class TestCodeReview:
         ctx.issue_title = "Fix"
         mock_cmd.return_value = "diff content"
         mock_agent.return_value = "Bug found.\nVERDICT:REJECTED"
-        with pytest.raises(RuntimeError, match="Code review rejected"):
+        with pytest.raises(ReviewRejectedError, match="Code review rejected"):
             code_review(ctx)
 
 
@@ -475,6 +483,78 @@ class TestRunPipeline:
         mock_fetch.side_effect = set_title
         mock_plan.side_effect = RuntimeError("agent failed")
         with pytest.raises(SystemExit, match="failed"):
+            run_pipeline(1, "owner/repo")
+
+    @patch("pipeline.emit_log")
+    @patch("pipeline.review_plan")
+    @patch("pipeline.create_plan")
+    @patch("pipeline.fetch_issue")
+    def test_plan_rejection_escalation(
+        self,
+        mock_fetch: Any,
+        mock_plan: Any,
+        mock_review: Any,
+        mock_emit: Any,
+    ) -> None:
+        def set_title(c: PipelineContext) -> None:
+            c.issue_title = "Test"
+
+        def set_plan(c: PipelineContext) -> None:
+            c.plan = "plan"
+
+        mock_fetch.side_effect = set_title
+        mock_plan.side_effect = set_plan
+        mock_review.side_effect = ReviewRejectedError("Plan rejected: bad")
+        with pytest.raises(SystemExit, match="rejections"):
+            run_pipeline(1, "owner/repo")
+
+    @patch("pipeline.emit_log")
+    @patch("pipeline.run_cmd")
+    @patch("pipeline.commit_changes")
+    @patch("pipeline.run_tests")
+    @patch("pipeline.implement")
+    @patch("pipeline.code_review")
+    @patch("pipeline.create_pr")
+    @patch("pipeline.smoke_test")
+    @patch("pipeline.review_plan")
+    @patch("pipeline.create_plan")
+    @patch("pipeline.create_branch")
+    @patch("pipeline.fetch_issue")
+    def test_code_review_rejection_no_push_on_last_attempt(
+        self,
+        mock_fetch: Any,
+        mock_branch: Any,
+        mock_plan: Any,
+        mock_review: Any,
+        mock_smoke: Any,
+        mock_pr: Any,
+        mock_code_review: Any,
+        mock_impl: Any,
+        mock_test: Any,
+        mock_commit: Any,
+        mock_run_cmd: Any,
+        mock_emit: Any,
+    ) -> None:
+        def set_title(c: PipelineContext) -> None:
+            c.issue_title = "Test"
+
+        def set_plan(c: PipelineContext) -> None:
+            c.plan = "plan"
+
+        def set_branch(c: PipelineContext) -> None:
+            c.branch_name = "issue-1"
+            c.worktree_path = "/tmp/wt"
+
+        def set_pr(c: PipelineContext) -> None:
+            c.pr_url = "https://example.com/pr/1"
+
+        mock_fetch.side_effect = set_title
+        mock_plan.side_effect = set_plan
+        mock_branch.side_effect = set_branch
+        mock_pr.side_effect = set_pr
+        mock_code_review.side_effect = ReviewRejectedError("Code review rejected: bad")
+        mock_run_cmd.return_value = ""
+        with pytest.raises(SystemExit, match="rejections"):
             run_pipeline(1, "owner/repo")
 
 

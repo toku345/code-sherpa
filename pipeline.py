@@ -190,7 +190,11 @@ def _summarize(ctx: PipelineContext, stage: Stage) -> str:
     return table.get(stage, "done")
 
 
-_PERMANENT_ERRORS = (FileNotFoundError, KeyError, TypeError)
+class ReviewRejectedError(RuntimeError):
+    """Raised when a reviewer explicitly rejects (VERDICT:REJECTED)."""
+
+
+_PERMANENT_ERRORS = (FileNotFoundError, KeyError, TypeError, ReviewRejectedError)
 
 
 def timed_stage(
@@ -267,7 +271,7 @@ def review_plan(ctx: PipelineContext) -> None:
         allowed_tools=READONLY_TOOLS,
     )
     if not _parse_verdict(output):
-        raise RuntimeError(f"Plan rejected: {output[:500]}")
+        raise ReviewRejectedError(f"Plan rejected: {output[:500]}")
 
 
 def create_branch(ctx: PipelineContext) -> None:
@@ -351,7 +355,7 @@ def code_review(ctx: PipelineContext) -> None:
         cwd=ctx.worktree_path,
     )
     if not _parse_verdict(output):
-        raise RuntimeError(f"Code review rejected: {output[:500]}")
+        raise ReviewRejectedError(f"Code review rejected: {output[:500]}")
 
 
 def wait_for_merge(ctx: PipelineContext) -> None:
@@ -379,16 +383,21 @@ def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
     ctx = PipelineContext(issue_number=issue_number, repo=repo)
     n = issue_number
     _run_stage(Stage.ISSUE_DETECTION, fetch_issue, ctx, f"issue #{n}")
-    for _ in range(MAX_RETRIES):
+    for attempt in range(MAX_RETRIES):
         _run_stage(Stage.PLAN_CREATION, create_plan, ctx, f"#{n}: {ctx.issue_title}")
-        r = _run_stage(Stage.PLAN_REVIEW, review_plan, ctx, f"plan for #{n}")
-        if r.status == "success":
+        try:
+            _run_stage(
+                Stage.PLAN_REVIEW, review_plan, ctx, f"plan for #{n}", max_attempts=2
+            )
             break
-        print(f"Plan rejected, regenerating... ({r.error})")
-    else:
-        raise SystemExit(
-            f"Plan review failed after {MAX_RETRIES} cycles. Escalating to human."
-        )
+        except ReviewRejectedError as exc:
+            ctx.last_error = str(exc)
+            if attempt >= MAX_RETRIES - 1:
+                raise SystemExit(
+                    f"Plan review failed after {MAX_RETRIES} rejections."
+                    " Escalating to human."
+                ) from exc
+            print("Plan rejected, regenerating...")
     _run_stage(Stage.BRANCH_CREATION, create_branch, ctx, f"branch #{n}")
     # Implementation → test loop: re-implement on test failure (design §2.2)
     _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"impl #{n}")
@@ -405,20 +414,29 @@ def run_pipeline(issue_number: int, repo: str) -> list[StageResult]:
     _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
     _run_stage(Stage.SMOKE_TEST, smoke_test, ctx, "smoke test")
     _run_stage(Stage.PR_CREATION, create_pr, ctx, f"PR for #{n}")
-    for _ in range(MAX_RETRIES):
-        r = _run_stage(Stage.CODE_REVIEW, code_review, ctx, f"review PR #{n}")
-        if r.status == "success":
+    for attempt in range(MAX_RETRIES):
+        try:
+            _run_stage(
+                Stage.CODE_REVIEW,
+                code_review,
+                ctx,
+                f"review PR #{n}",
+                max_attempts=2,
+            )
             break
-        print(f"Code review rejected, fixing... ({r.error})")
-        _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"fix #{n}")
-        _run_stage(Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy")
-        _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
-        print(f"Pushing fixes to {ctx.branch_name}...")
-        run_cmd(["git", "push"], cwd=ctx.worktree_path)
-    else:
-        raise SystemExit(
-            f"Code review failed after {MAX_RETRIES} cycles. Escalating to human."
-        )
+        except ReviewRejectedError as exc:
+            ctx.last_error = str(exc)
+            if attempt >= MAX_RETRIES - 1:
+                raise SystemExit(
+                    f"Code review failed after {MAX_RETRIES} rejections."
+                    " Escalating to human."
+                ) from exc
+            print(f"Code review rejected, fixing... ({exc})")
+            _run_stage(Stage.IMPLEMENTATION, implement, ctx, f"fix #{n}")
+            _run_stage(Stage.TEST_EXECUTION, run_tests, ctx, "pytest+ruff+mypy")
+            _run_stage(Stage.COMMIT_CHANGES, commit_changes, ctx, "git commit")
+            print(f"Pushing fixes to {ctx.branch_name}...")
+            run_cmd(["git", "push"], cwd=ctx.worktree_path)
     _run_stage(Stage.MERGE_DECISION, wait_for_merge, ctx, f"PR: {ctx.pr_url}")
     return ctx.results
 
