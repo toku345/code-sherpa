@@ -205,6 +205,7 @@ def timed_stage(
     output, err = "", None
     try:
         func(ctx)
+        ctx.last_error = ""
         output = _summarize(ctx, stage)
     except _PERMANENT_ERRORS:
         raise

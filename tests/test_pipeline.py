@@ -161,6 +161,16 @@ class TestTimedStage:
         assert result.error == "boom"
         assert ctx.last_error == "boom"
 
+    def test_success_clears_last_error(self, ctx: PipelineContext) -> None:
+        ctx.last_error = "stale error from previous stage"
+
+        def noop(c: PipelineContext) -> None:
+            pass
+
+        result = timed_stage(Stage.SMOKE_TEST, noop, ctx, "test")
+        assert result.status == "success"
+        assert ctx.last_error == ""
+
     def test_permanent_error_reraises(self, ctx: PipelineContext) -> None:
         def fail_permanent(c: PipelineContext) -> None:
             raise FileNotFoundError("missing template")
