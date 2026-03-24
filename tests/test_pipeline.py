@@ -35,7 +35,7 @@ def ctx() -> PipelineContext:
 @pytest.fixture
 def tmp_prompts(tmp_path: Path) -> Path:
     tpl = tmp_path / "test.md"
-    tpl.write_text("Hello {name}, issue #{num}")
+    tpl.write_text("Hello {name}, issue #{num}", encoding="utf-8")
     return tmp_path
 
 
@@ -640,7 +640,7 @@ class TestRunAgentParsing:
 class TestLoadPromptBraces:
     def test_diff_with_braces_does_not_crash(self, tmp_path: Path) -> None:
         tpl = tmp_path / "review.md"
-        tpl.write_text("Review: {diff}\n")
+        tpl.write_text("Review: {diff}\n", encoding="utf-8")
         result = load_prompt(
             "review.md",
             _prompts_dir=tmp_path,
@@ -651,7 +651,7 @@ class TestLoadPromptBraces:
 
     def test_value_containing_placeholder_not_reexpanded(self, tmp_path: Path) -> None:
         tpl = tmp_path / "tpl.md"
-        tpl.write_text("{first} and {second}")
+        tpl.write_text("{first} and {second}", encoding="utf-8")
         result = load_prompt(
             "tpl.md",
             _prompts_dir=tmp_path,
