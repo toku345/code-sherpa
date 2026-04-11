@@ -65,7 +65,7 @@ class TestRunAgent:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude", "-p", "--output-format", "json"],
                 returncode=0,
-                stdout='{"result": "done"}',
+                stdout='[{"type":"system"},{"type":"result","result":"done"}]',
                 stderr="",
             )
             result = run_agent("do something")
@@ -73,6 +73,20 @@ class TestRunAgent:
             mock_run.assert_called_once()
             call_kwargs = mock_run.call_args
             assert call_kwargs.kwargs["input"] == "do something"
+
+    def test_picks_last_result_event(self) -> None:
+        with patch("pipeline.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["claude", "-p", "--output-format", "json"],
+                returncode=0,
+                stdout=(
+                    '[{"type":"system","subtype":"init"},'
+                    '{"type":"assistant","message":{"content":"ignored"}},'
+                    '{"type":"result","subtype":"success","result":"final answer"}]'
+                ),
+                stderr="",
+            )
+            assert run_agent("do something") == "final answer"
 
     def test_failure(self) -> None:
         with patch("pipeline.subprocess.run") as mock_run:
@@ -103,15 +117,26 @@ class TestRunAgent:
             with pytest.raises(RuntimeError, match=r"claude: invalid JSON"):
                 run_agent("do something")
 
-    def test_missing_result_key(self) -> None:
+    def test_non_array_output(self) -> None:
         with patch("pipeline.subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude", "-p", "--output-format", "json"],
                 returncode=0,
-                stdout='{"other": "value"}',
+                stdout='{"result": "done"}',
                 stderr="",
             )
-            with pytest.raises(RuntimeError, match=r"claude: missing 'result' key"):
+            with pytest.raises(RuntimeError, match=r"claude: expected JSON array"):
+                run_agent("do something")
+
+    def test_no_result_event(self) -> None:
+        with patch("pipeline.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=["claude", "-p", "--output-format", "json"],
+                returncode=0,
+                stdout='[{"type":"system"},{"type":"assistant"}]',
+                stderr="",
+            )
+            with pytest.raises(RuntimeError, match=r"claude: no result event"):
                 run_agent("do something")
 
 

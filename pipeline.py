@@ -91,10 +91,18 @@ def run_agent(
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{cmd[0]}: invalid JSON: {stdout[:200]}") from exc
 
-    if not isinstance(data, dict) or "result" not in data:
-        raise RuntimeError(f"{cmd[0]}: missing 'result' key: {stdout[:200]}")
+    if not isinstance(data, list):
+        raise RuntimeError(f"{cmd[0]}: expected JSON array, got: {stdout[:200]}")
 
-    return str(data["result"])
+    for event in reversed(data):
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "result"
+            and "result" in event
+        ):
+            return str(event["result"])
+
+    raise RuntimeError(f"{cmd[0]}: no result event in stream: {stdout[:200]}")
 
 
 def load_prompt(
