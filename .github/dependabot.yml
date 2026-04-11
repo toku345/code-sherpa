@@ -4,11 +4,6 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    groups:
-      dev-dependencies:
-        dependency-type: "development"
-        patterns:
-          - "*"
     commit-message:
       prefix: "deps"
       prefix-development: "deps(dev)"
@@ -17,9 +12,5 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    groups:
-      actions:
-        patterns:
-          - "*"
     commit-message:
       prefix: "ci"
