@@ -5,8 +5,10 @@ and review stages.
 """
 
 import json
+import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -89,10 +91,18 @@ def run_agent(
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{cmd[0]}: invalid JSON: {stdout[:200]}") from exc
 
-    if not isinstance(data, dict) or "result" not in data:
-        raise RuntimeError(f"{cmd[0]}: missing 'result' key: {stdout[:200]}")
+    if not isinstance(data, list):
+        raise RuntimeError(f"{cmd[0]}: expected JSON array, got: {stdout[:200]}")
 
-    return str(data["result"])
+    for event in reversed(data):
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "result"
+            and "result" in event
+        ):
+            return str(event["result"])
+
+    raise RuntimeError(f"{cmd[0]}: no result event in stream: {stdout[:200]}")
 
 
 def load_prompt(
@@ -109,3 +119,106 @@ def load_prompt(
         return variables.get(key, match.group(0))
 
     return re.sub(r"\{\{(\w+)\}\}", replacer, template)
+
+
+def _detect_repo() -> str:
+    repo = os.environ.get("CODE_SHERPA_REPO")
+    if repo:
+        return repo
+    return run_cmd(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]
+    ).strip()
+
+
+def fetch_issue(ctx: PipelineContext) -> None:
+    raw = run_cmd(
+        [
+            "gh",
+            "issue",
+            "view",
+            str(ctx.issue_number),
+            "--repo",
+            ctx.repo,
+            "--json",
+            "title,body",
+        ]
+    )
+    data = json.loads(raw)
+    ctx.issue_title = data["title"]
+    ctx.issue_body = data["body"]
+
+
+def create_branch(ctx: PipelineContext) -> None:
+    worktree_path = f"../code-sherpa-worktrees/issue-{ctx.issue_number}"
+    branch_name = f"feat/issue-{ctx.issue_number}"
+    run_cmd(["git", "fetch", "origin", "main"])
+    run_cmd(["git", "worktree", "add", "-b", branch_name, worktree_path, "origin/main"])
+    ctx.worktree_path = worktree_path
+    ctx.branch_name = branch_name
+
+
+def implement(ctx: PipelineContext) -> None:
+    plan = f"{ctx.issue_title}\n\n{ctx.issue_body}"
+    prompt = load_prompt("implement.md", plan=plan, last_error=ctx.last_error)
+    run_agent(prompt, cwd=ctx.worktree_path)
+
+
+def run_tests(ctx: PipelineContext) -> None:
+    cwd = ctx.worktree_path
+    run_cmd(["uv", "run", "ruff", "check", "."], cwd=cwd)
+    run_cmd(["uv", "run", "ruff", "format", "--check", "."], cwd=cwd)
+    run_cmd(["uv", "run", "pytest"], cwd=cwd)
+
+
+def create_pr(ctx: PipelineContext) -> None:
+    cwd = ctx.worktree_path
+    run_cmd(["git", "add", "-A"], cwd=cwd)
+    run_cmd(
+        ["git", "commit", "-m", f"feat: implement issue #{ctx.issue_number}"],
+        cwd=cwd,
+    )
+    run_cmd(["git", "push", "-u", "origin", ctx.branch_name], cwd=cwd)
+    run_cmd(
+        [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            ctx.repo,
+            "--title",
+            f"feat: {ctx.issue_title}",
+            "--body",
+            f"Closes #{ctx.issue_number}\n\nAutomated by code-sherpa pipeline.",
+        ],
+        cwd=cwd,
+    )
+
+
+def run_pipeline(issue_number: int, repo: str) -> None:
+    ctx = PipelineContext(issue_number=issue_number, repo=repo)
+    fetch_issue(ctx)
+    create_branch(ctx)
+    try:
+        implement(ctx)
+        run_tests(ctx)
+        create_pr(ctx)
+    finally:
+        if ctx.worktree_path:
+            run_cmd(["git", "worktree", "remove", "--force", ctx.worktree_path])
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        print("Usage: pipeline.py <issue-number>", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        issue_number = int(sys.argv[1])
+    except ValueError:
+        print(f"Invalid issue number: {sys.argv[1]}", file=sys.stderr)
+        raise SystemExit(1) from None
+    repo = _detect_repo()
+    run_pipeline(issue_number, repo)
+
+
+if __name__ == "__main__":
+    main()
