@@ -155,6 +155,15 @@ class TestMain:
             pipeline.main()
         assert exc_info.value.code == 1
 
+    @pytest.mark.parametrize("arg", ["0", "-1"])
+    def test_non_positive_arg_raises_system_exit(
+        self, monkeypatch: pytest.MonkeyPatch, arg: str
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["pipeline.py", arg])
+        with pytest.raises(SystemExit) as exc_info:
+            pipeline.main()
+        assert exc_info.value.code == 1
+
     def test_valid_args_invokes_run_pipeline(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -168,26 +177,46 @@ class TestMain:
 
 
 class TestRunPipeline:
-    def test_success_runs_all_stages_and_cleans_up(self) -> None:
-        def set_worktree(ctx: PipelineContext) -> None:
+    def test_success_runs_all_stages_in_order_and_cleans_up(self) -> None:
+        calls: list[str] = []
+
+        def fetch(ctx: PipelineContext) -> None:
+            calls.append("fetch_issue")
+
+        def branch(ctx: PipelineContext) -> None:
+            calls.append("create_branch")
             ctx.worktree_path = "/tmp/wt"
 
+        def implement(ctx: PipelineContext) -> None:
+            calls.append("implement")
+
+        def tests(ctx: PipelineContext) -> None:
+            calls.append("run_tests")
+
+        def pr(ctx: PipelineContext) -> None:
+            calls.append("create_pr")
+
+        def cleanup(*args: object, **kwargs: object) -> str:
+            calls.append("cleanup")
+            return ""
+
         with (
-            patch("pipeline.fetch_issue") as mock_fetch,
-            patch(
-                "pipeline.create_branch", side_effect=set_worktree
-            ) as mock_create_branch,
-            patch("pipeline.implement") as mock_implement,
-            patch("pipeline.run_tests") as mock_run_tests,
-            patch("pipeline.create_pr") as mock_create_pr,
-            patch("pipeline.run_cmd") as mock_run_cmd,
+            patch("pipeline.fetch_issue", side_effect=fetch),
+            patch("pipeline.create_branch", side_effect=branch),
+            patch("pipeline.implement", side_effect=implement),
+            patch("pipeline.run_tests", side_effect=tests),
+            patch("pipeline.create_pr", side_effect=pr),
+            patch("pipeline.run_cmd", side_effect=cleanup) as mock_run_cmd,
         ):
             pipeline.run_pipeline(issue_number=1, repo="owner/repo")
-            mock_fetch.assert_called_once()
-            mock_create_branch.assert_called_once()
-            mock_implement.assert_called_once()
-            mock_run_tests.assert_called_once()
-            mock_create_pr.assert_called_once()
+            assert calls == [
+                "fetch_issue",
+                "create_branch",
+                "implement",
+                "run_tests",
+                "create_pr",
+                "cleanup",
+            ]
             mock_run_cmd.assert_called_once_with(
                 ["git", "worktree", "remove", "--force", "/tmp/wt"]
             )

@@ -216,6 +216,9 @@ def main() -> None:
     except ValueError:
         print(f"Invalid issue number: {sys.argv[1]}", file=sys.stderr)
         raise SystemExit(1) from None
+    if issue_number <= 0:
+        print(f"Invalid issue number: {sys.argv[1]}", file=sys.stderr)
+        raise SystemExit(1)
     repo = _detect_repo()
     run_pipeline(issue_number, repo)
 
