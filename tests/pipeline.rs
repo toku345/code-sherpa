@@ -73,6 +73,25 @@ fn run_cmd_timeout_kills_descendants_holding_pipes() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn run_cmd_timeout_covers_early_parent_exit_with_descendant_pipe_holder() {
+    let start = Instant::now();
+    let err = run_cmd(
+        &["/bin/sh", "-c", "(sleep 30) & exit 0"],
+        None,
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("timed out after 1s"), "{err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "timeout waited for descendant pipe holders after parent exit: {:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn run_cmd_failure() {
     let err = run_cmd(

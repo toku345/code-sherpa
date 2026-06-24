@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use wait_timeout::ChildExt;
 
 #[cfg(unix)]
@@ -29,6 +30,8 @@ unsafe extern "C" {
 pub const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(120);
 /// Default timeout for agent invocations.
 pub const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(300);
+
+const CAPTURE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A stage in the pipeline, in execution order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +109,7 @@ fn capture(
     timeout: Duration,
     label: &str,
 ) -> Result<String> {
+    let deadline = Instant::now() + timeout;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin_data.is_some() {
         command.stdin(Stdio::piped());
@@ -119,7 +123,7 @@ fn capture(
     let stdin_writer = if let Some(data) = stdin_data {
         let mut stdin = child.stdin.take().expect("stdin was piped");
         let owned = data.to_owned();
-        Some(std::thread::spawn(move || {
+        Some(spawn_io_thread("write stdin", move || {
             stdin.write_all(owned.as_bytes()).context("write stdin")
         }))
     } else {
@@ -128,14 +132,14 @@ fn capture(
 
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-    let stdout_reader = std::thread::spawn(move || {
+    let stdout_reader = spawn_io_thread("read stdout", move || {
         let mut buf = String::new();
         stdout_pipe
             .read_to_string(&mut buf)
             .context("read stdout")?;
         Ok(buf)
     });
-    let stderr_reader = std::thread::spawn(move || {
+    let stderr_reader = spawn_io_thread("read stderr", move || {
         let mut buf = String::new();
         stderr_pipe
             .read_to_string(&mut buf)
@@ -152,9 +156,13 @@ fn capture(
             {
                 cleanup_errors.push(format!("{cleanup_err:#}"));
             }
-            if let Err(capture_err) =
-                join_capture_threads(stdin_writer, stdout_reader, stderr_reader, label)
-            {
+            if let Err(capture_err) = wait_capture_threads(
+                stdin_writer,
+                stdout_reader,
+                stderr_reader,
+                label,
+                cleanup_deadline(),
+            ) {
                 cleanup_errors.push(format!("{capture_err:#}"));
             }
 
@@ -170,8 +178,24 @@ fn capture(
 
     match status {
         Some(status) => {
-            let (stdout, stderr) =
-                join_capture_threads(stdin_writer, stdout_reader, stderr_reader, label)?;
+            let (stdout, stderr) = match wait_capture_threads(
+                stdin_writer,
+                stdout_reader,
+                stderr_reader,
+                label,
+                deadline,
+            ) {
+                Ok(output) => output,
+                Err(CaptureError::TimedOut(err)) => {
+                    terminate_child_processes(
+                        &mut child,
+                        label,
+                        "timed out while waiting for captured output",
+                    )?;
+                    bail!("{label}: timed out after {}s; {err:#}", timeout.as_secs());
+                }
+                Err(CaptureError::Failed(err)) => return Err(err),
+            };
             if status.success() {
                 Ok(stdout)
             } else {
@@ -185,9 +209,13 @@ fn capture(
         }
         None => {
             terminate_child_processes(&mut child, label, "timed out")?;
-            if let Err(err) =
-                join_capture_threads(stdin_writer, stdout_reader, stderr_reader, label)
-            {
+            if let Err(err) = wait_capture_threads(
+                stdin_writer,
+                stdout_reader,
+                stderr_reader,
+                label,
+                cleanup_deadline(),
+            ) {
                 bail!("{label}: timed out after {}s; {err:#}", timeout.as_secs());
             }
             bail!("{label}: timed out after {}s", timeout.as_secs())
@@ -236,51 +264,142 @@ fn terminate_child_processes(child: &mut Child, label: &str, reason: &str) -> Re
     }
 }
 
-fn join_capture_threads(
-    stdin_writer: Option<JoinHandle<Result<()>>>,
-    stdout_reader: JoinHandle<Result<String>>,
-    stderr_reader: JoinHandle<Result<String>>,
+struct IoThread<T> {
+    action: &'static str,
+    receiver: Receiver<Result<T>>,
+    handle: JoinHandle<()>,
+}
+
+enum CaptureError {
+    TimedOut(Error),
+    Failed(Error),
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureError::TimedOut(err) | CaptureError::Failed(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::fmt::Debug for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+fn spawn_io_thread<T>(
+    action: &'static str,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> IoThread<T>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+
+    IoThread {
+        action,
+        receiver,
+        handle,
+    }
+}
+
+fn cleanup_deadline() -> Instant {
+    Instant::now() + CAPTURE_CLEANUP_TIMEOUT
+}
+
+fn wait_capture_threads(
+    stdin_writer: Option<IoThread<()>>,
+    stdout_reader: IoThread<String>,
+    stderr_reader: IoThread<String>,
     label: &str,
-) -> Result<(String, String)> {
+    deadline: Instant,
+) -> std::result::Result<(String, String), CaptureError> {
     let mut first_error = None;
 
     if let Some(writer) = stdin_writer
-        && let Err(err) = join_io_thread(writer, label, "write stdin")
+        && let Err(err) = wait_io_thread(writer, label, deadline)
     {
-        first_error = Some(err);
+        match err {
+            CaptureError::TimedOut(err) => return Err(CaptureError::TimedOut(err)),
+            CaptureError::Failed(err) => first_error = Some(err),
+        }
     }
 
-    let stdout = match join_io_thread(stdout_reader, label, "read stdout") {
+    let stdout = match wait_io_thread(stdout_reader, label, deadline) {
         Ok(stdout) => stdout,
-        Err(err) => {
-            if first_error.is_none() {
-                first_error = Some(err);
+        Err(err) => match err {
+            CaptureError::TimedOut(err) => return Err(CaptureError::TimedOut(err)),
+            CaptureError::Failed(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+                String::new()
             }
-            String::new()
-        }
+        },
     };
 
-    let stderr = match join_io_thread(stderr_reader, label, "read stderr") {
+    let stderr = match wait_io_thread(stderr_reader, label, deadline) {
         Ok(stderr) => stderr,
-        Err(err) => {
-            if first_error.is_none() {
-                first_error = Some(err);
+        Err(err) => match err {
+            CaptureError::TimedOut(err) => return Err(CaptureError::TimedOut(err)),
+            CaptureError::Failed(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+                String::new()
             }
-            String::new()
-        }
+        },
     };
 
     if let Some(err) = first_error {
-        Err(err)
+        Err(CaptureError::Failed(err))
     } else {
         Ok((stdout, stderr))
     }
 }
 
-fn join_io_thread<T>(handle: JoinHandle<Result<T>>, label: &str, action: &str) -> Result<T> {
-    match handle.join() {
-        Ok(result) => result.with_context(|| format!("{label}: failed to {action}")),
-        Err(_) => bail!("{label}: {action} thread panicked"),
+fn wait_io_thread<T>(
+    thread: IoThread<T>,
+    label: &str,
+    deadline: Instant,
+) -> std::result::Result<T, CaptureError> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(CaptureError::TimedOut(anyhow!(
+            "{label}: timed out while waiting to {}",
+            thread.action
+        )));
+    };
+
+    let result = match thread.receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            return Err(CaptureError::TimedOut(anyhow!(
+                "{label}: timed out while waiting to {}",
+                thread.action
+            )));
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let err = match thread.handle.join() {
+                Ok(()) => anyhow!("{label}: {} thread exited without result", thread.action),
+                Err(_) => anyhow!("{label}: {} thread panicked", thread.action),
+            };
+            return Err(CaptureError::Failed(err));
+        }
+    };
+
+    match thread.handle.join() {
+        Ok(()) => result
+            .with_context(|| format!("{label}: failed to {}", thread.action))
+            .map_err(CaptureError::Failed),
+        Err(_) => Err(CaptureError::Failed(anyhow!(
+            "{label}: {} thread panicked",
+            thread.action
+        ))),
     }
 }
 
