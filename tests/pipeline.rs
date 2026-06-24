@@ -4,6 +4,7 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 #[cfg(unix)]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -46,6 +47,17 @@ fn pipeline_context_defaults() {
 fn run_cmd_success() {
     let out = run_cmd(&["echo", "hello"], None, Duration::from_secs(10)).unwrap();
     assert_eq!(out, "hello\n");
+}
+
+#[test]
+fn run_cmd_honors_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_cmd(&["pwd"], Some(dir.path()), Duration::from_secs(10)).unwrap();
+
+    assert_eq!(
+        std::fs::canonicalize(out.trim()).unwrap(),
+        std::fs::canonicalize(dir.path()).unwrap()
+    );
 }
 
 #[test]
@@ -122,6 +134,7 @@ fn run_agent_passes_prompt_to_claude_and_parses_result() {
     let work = tempfile::tempdir().unwrap();
     let result = with_fake_claude(
         r#"#!/bin/sh
+printf '%s\n' "$@" > args.txt
 cat > prompt.txt
 printf '{"result":"agent done"}'
 "#,
@@ -132,6 +145,10 @@ printf '{"result":"agent done"}'
     assert_eq!(
         std::fs::read_to_string(work.path().join("prompt.txt")).unwrap(),
         "please plan"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("args.txt")).unwrap(),
+        "-p\n--output-format\njson\n"
     );
 }
 
@@ -180,6 +197,31 @@ fn parse_agent_output_invalid_json() {
 fn parse_agent_output_missing_result() {
     let err = parse_agent_output(r#"{"other": "value"}"#).unwrap_err();
     assert!(err.to_string().contains("missing 'result' key"), "{err}");
+}
+
+#[test]
+fn parse_agent_output_rejects_non_string_result() {
+    let err = parse_agent_output(r#"{"result": null}"#).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("'result' must be a string, got null"),
+        "{err}"
+    );
+}
+
+#[test]
+fn cli_fails_until_pipeline_orchestration_exists() {
+    let output = Command::new(env!("CARGO_BIN_EXE_code-sherpa"))
+        .args(["123", "--repo", "owner/repo"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("pipeline orchestration is not implemented yet"),
+        "{stderr}"
+    );
 }
 
 #[test]

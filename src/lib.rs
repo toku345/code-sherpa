@@ -435,8 +435,23 @@ pub fn parse_agent_output(stdout: &str) -> Result<String> {
         .map_err(|_| anyhow!("claude: invalid JSON: {}", truncate(stdout, 200)))?;
     match data.get("result") {
         Some(serde_json::Value::String(s)) => Ok(s.clone()),
-        Some(other) => Ok(other.to_string()),
+        Some(other) => bail!(
+            "claude: 'result' must be a string, got {}: {}",
+            json_value_kind(other),
+            truncate(stdout, 200)
+        ),
         None => bail!("claude: missing 'result' key: {}", truncate(stdout, 200)),
+    }
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 

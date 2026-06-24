@@ -18,7 +18,7 @@ struct Cli {
     repo: String,
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let ctx = PipelineContext::new(cli.issue_number, cli.repo);
 
@@ -27,4 +27,5 @@ fn main() {
         ctx.issue_number, ctx.repo
     );
     eprintln!("stages: {:?}", Stage::ALL.map(|s| s.as_str()));
+    anyhow::bail!("pipeline orchestration is not implemented yet")
 }
