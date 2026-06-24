@@ -1,9 +1,17 @@
 //! Tests for the pipeline primitives.
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::time::Duration;
 
-use code_sherpa::{PipelineContext, Stage, load_prompt, parse_agent_output, run_cmd};
+use code_sherpa::{PipelineContext, Stage, load_prompt, parse_agent_output, run_agent, run_cmd};
+
+#[cfg(unix)]
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn stage_values_and_order() {
@@ -57,6 +65,55 @@ fn run_cmd_failure() {
     assert!(err.to_string().starts_with("ls:"), "{err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn run_agent_passes_prompt_to_claude_and_parses_result() {
+    let work = tempfile::tempdir().unwrap();
+    let result = with_fake_claude(
+        r#"#!/bin/sh
+cat > prompt.txt
+printf '{"result":"agent done"}'
+"#,
+        || run_agent("please plan", Some(work.path()), Duration::from_secs(10)),
+    );
+
+    assert_eq!(result.unwrap(), "agent done");
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("prompt.txt")).unwrap(),
+        "please plan"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_agent_surfaces_claude_stderr_on_failure() {
+    let err = with_fake_claude(
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'agent failed\n' >&2
+exit 7
+"#,
+        || run_agent("please plan", None, Duration::from_secs(10)),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().starts_with("claude: agent failed"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_agent_times_out() {
+    let err = with_fake_claude(
+        r#"#!/bin/sh
+sleep 5
+"#,
+        || run_agent("please plan", None, Duration::from_secs(1)),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("timed out after 1s"), "{err}");
+}
+
 #[test]
 fn parse_agent_output_success() {
     assert_eq!(parse_agent_output(r#"{"result": "done"}"#).unwrap(), "done");
@@ -99,4 +156,42 @@ fn load_prompt_no_reexpansion() {
     let vars = HashMap::from([("first", "{{second}}"), ("second", "BOOM")]);
     let out = load_prompt("test.md", dir.path(), &vars).unwrap();
     assert_eq!(out, "{{second}} and BOOM");
+}
+
+#[cfg(unix)]
+fn with_fake_claude<T>(script: &str, f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let bin_dir = tempfile::tempdir().unwrap();
+    let claude_path = bin_dir.path().join("claude");
+    write_executable(&claude_path, script);
+
+    let old_path = std::env::var_os("PATH");
+    let mut paths = vec![bin_dir.path().to_path_buf()];
+    if let Some(path) = &old_path {
+        paths.extend(std::env::split_paths(path));
+    }
+    let new_path = std::env::join_paths(paths).unwrap();
+
+    // SAFETY: tests that mutate PATH are serialized by ENV_LOCK.
+    unsafe {
+        std::env::set_var("PATH", new_path);
+    }
+    let result = f();
+    // SAFETY: tests that mutate PATH are serialized by ENV_LOCK.
+    unsafe {
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    result
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, script: &str) {
+    std::fs::write(path, script).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
 }
