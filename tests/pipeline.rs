@@ -57,19 +57,9 @@ fn run_cmd_timeout() {
 #[cfg(unix)]
 #[test]
 fn run_cmd_timeout_kills_descendants_holding_pipes() {
-    let bin_dir = tempfile::tempdir().unwrap();
-    let script_path = bin_dir.path().join("spawn-child");
-    write_executable(
-        &script_path,
-        r#"#!/bin/sh
-(sleep 30) &
-sleep 30
-"#,
-    );
-
     let start = Instant::now();
     let err = run_cmd(
-        &[script_path.to_str().unwrap()],
+        &["/bin/sh", "-c", "(sleep 30) & sleep 30"],
         None,
         Duration::from_secs(1),
     )
@@ -97,17 +87,8 @@ fn run_cmd_failure() {
 #[cfg(unix)]
 #[test]
 fn run_cmd_drains_large_stdout_without_deadlock() {
-    let bin_dir = tempfile::tempdir().unwrap();
-    let script_path = bin_dir.path().join("large-stdout");
-    write_executable(
-        &script_path,
-        r#"#!/bin/sh
-yes x | head -c 200000
-"#,
-    );
-
     let out = run_cmd(
-        &[script_path.to_str().unwrap()],
+        &["/bin/sh", "-c", "yes x | head -c 200000"],
         None,
         Duration::from_secs(10),
     )
