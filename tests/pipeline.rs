@@ -209,6 +209,44 @@ fn load_prompt_no_reexpansion() {
     assert_eq!(out, "{{second}} and BOOM");
 }
 
+#[test]
+fn load_prompt_unterminated_placeholder() {
+    // An opening "{{" with no closing "}}" is emitted verbatim.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("test.md"), "Hello {{name").unwrap();
+    let vars = HashMap::from([("name", "Alice")]);
+    let out = load_prompt("test.md", dir.path(), &vars).unwrap();
+    assert_eq!(out, "Hello {{name");
+}
+
+#[test]
+fn load_prompt_invalid_placeholder_keys_preserved() {
+    // Keys with spaces, punctuation, or empty are not valid placeholders;
+    // the literal "{{" is emitted and the rest is preserved verbatim.
+    let dir = tempfile::tempdir().unwrap();
+    for (template, expected) in [
+        ("{{ name }}", "{{ name }}"),
+        ("{{a-b}}", "{{a-b}}"),
+        ("{{}}", "{{}}"),
+    ] {
+        std::fs::write(dir.path().join("test.md"), template).unwrap();
+        let vars = HashMap::from([("name", "Alice"), ("a", "X")]);
+        let out = load_prompt("test.md", dir.path(), &vars).unwrap();
+        assert_eq!(out, expected, "template {template:?}");
+    }
+}
+
+#[test]
+fn load_prompt_resumes_after_invalid_placeholder() {
+    // After emitting the literal "{{" for an invalid placeholder, scanning
+    // resumes and a following valid placeholder is still substituted.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("test.md"), "{{ bad }}{{name}}").unwrap();
+    let vars = HashMap::from([("name", "Alice")]);
+    let out = load_prompt("test.md", dir.path(), &vars).unwrap();
+    assert_eq!(out, "{{ bad }}Alice");
+}
+
 #[cfg(unix)]
 fn with_fake_claude<T>(script: &str, f: impl FnOnce() -> T) -> T {
     let _guard = ENV_LOCK.lock().unwrap();
