@@ -7,12 +7,23 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use wait_timeout::ChildExt;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
 
 /// Default timeout for deterministic shell commands.
 pub const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -99,6 +110,7 @@ fn capture(
     if stdin_data.is_some() {
         command.stdin(Stdio::piped());
     }
+    isolate_child_processes(&mut command);
 
     let mut child = command
         .spawn()
@@ -134,10 +146,25 @@ fn capture(
     let status = match child.wait_timeout(timeout) {
         Ok(status) => status,
         Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = join_capture_threads(stdin_writer, stdout_reader, stderr_reader, label);
-            return Err(err).with_context(|| format!("{label}: failed while waiting"));
+            let mut cleanup_errors = Vec::new();
+            if let Err(cleanup_err) =
+                terminate_child_processes(&mut child, label, "failed while waiting")
+            {
+                cleanup_errors.push(format!("{cleanup_err:#}"));
+            }
+            if let Err(capture_err) =
+                join_capture_threads(stdin_writer, stdout_reader, stderr_reader, label)
+            {
+                cleanup_errors.push(format!("{capture_err:#}"));
+            }
+
+            if cleanup_errors.is_empty() {
+                return Err(err).with_context(|| format!("{label}: failed while waiting"));
+            }
+            bail!(
+                "{label}: failed while waiting: {err}; cleanup errors: {}",
+                cleanup_errors.join("; ")
+            );
         }
     };
 
@@ -157,12 +184,7 @@ fn capture(
             }
         }
         None => {
-            child
-                .kill()
-                .with_context(|| format!("{label}: timed out and failed to kill child"))?;
-            child
-                .wait()
-                .with_context(|| format!("{label}: timed out and failed to reap child"))?;
+            terminate_child_processes(&mut child, label, "timed out")?;
             if let Err(err) =
                 join_capture_threads(stdin_writer, stdout_reader, stderr_reader, label)
             {
@@ -170,6 +192,47 @@ fn capture(
             }
             bail!("{label}: timed out after {}s", timeout.as_secs())
         }
+    }
+}
+
+fn isolate_child_processes(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+fn terminate_child_processes(child: &mut Child, label: &str, reason: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as i32;
+        // SAFETY: `pgid` is the just-spawned child process group. Passing a
+        // negative pid asks POSIX `kill` to signal that process group.
+        let kill_result = unsafe { kill(-pgid, SIGKILL) };
+        if kill_result == -1 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("{label}: {reason} and failed to kill process group"));
+        }
+        child
+            .wait()
+            .with_context(|| format!("{label}: {reason} and failed to reap child"))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        child
+            .kill()
+            .with_context(|| format!("{label}: {reason} and failed to kill child"))?;
+        child
+            .wait()
+            .with_context(|| format!("{label}: {reason} and failed to reap child"))?;
+        Ok(())
     }
 }
 

@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 #[cfg(unix)]
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use code_sherpa::{PipelineContext, Stage, load_prompt, parse_agent_output, run_agent, run_cmd};
 
@@ -54,6 +54,35 @@ fn run_cmd_timeout() {
     assert!(err.to_string().contains("timed out after 1s"), "{err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn run_cmd_timeout_kills_descendants_holding_pipes() {
+    let bin_dir = tempfile::tempdir().unwrap();
+    let script_path = bin_dir.path().join("spawn-child");
+    write_executable(
+        &script_path,
+        r#"#!/bin/sh
+(sleep 30) &
+sleep 30
+"#,
+    );
+
+    let start = Instant::now();
+    let err = run_cmd(
+        &[script_path.to_str().unwrap()],
+        None,
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("timed out after 1s"), "{err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "timeout waited for descendant pipe holders: {:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn run_cmd_failure() {
     let err = run_cmd(
@@ -63,6 +92,28 @@ fn run_cmd_failure() {
     )
     .unwrap_err();
     assert!(err.to_string().starts_with("ls:"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_cmd_drains_large_stdout_without_deadlock() {
+    let bin_dir = tempfile::tempdir().unwrap();
+    let script_path = bin_dir.path().join("large-stdout");
+    write_executable(
+        &script_path,
+        r#"#!/bin/sh
+yes x | head -c 200000
+"#,
+    );
+
+    let out = run_cmd(
+        &[script_path.to_str().unwrap()],
+        None,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+
+    assert_eq!(out.len(), 200_000);
 }
 
 #[cfg(unix)]
