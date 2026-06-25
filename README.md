@@ -11,5 +11,18 @@ GitHub Issue を検知から PR 作成・マージ判断まで自律的に進行
 ```bash
 cargo build
 cargo test --all
-cargo run -- <issue_number> --repo <owner/repo>
+cargo run --bin sherpa -- <issue_number>
+```
+
+## ローカルインストール
+
+```bash
+cargo install --path .
+```
+
+インストール後は、対象リポジトリの中で実行する。`origin` remote から `owner/repo` を推定する。
+
+```bash
+cd target-repo
+sherpa <issue_number>
 ```

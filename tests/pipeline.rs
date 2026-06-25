@@ -32,13 +32,13 @@ fn stage_values_and_order() {
 
 #[test]
 fn pipeline_context_defaults() {
-    let ctx = PipelineContext::new(1, "owner/repo");
+    let ctx = PipelineContext::new(1, "owner/repo", "/tmp/worktree");
     assert_eq!(ctx.issue_number, 1);
     assert_eq!(ctx.repo, "owner/repo");
     assert_eq!(ctx.issue_title, "");
     assert_eq!(ctx.issue_body, "");
     assert_eq!(ctx.plan, "");
-    assert_eq!(ctx.worktree_path, "");
+    assert_eq!(ctx.worktree_path, "/tmp/worktree");
     assert_eq!(ctx.branch_name, "");
     assert_eq!(ctx.last_error, "");
 }
@@ -211,17 +211,77 @@ fn parse_agent_output_rejects_non_string_result() {
 
 #[test]
 fn cli_fails_until_pipeline_orchestration_exists() {
-    let output = Command::new(env!("CARGO_BIN_EXE_code-sherpa"))
-        .args(["123", "--repo", "owner/repo"])
+    let dir = tempfile::tempdir().unwrap();
+    run_git(&["init"], dir.path());
+    run_git(
+        &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        dir.path(),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sherpa"))
+        .arg("123")
+        .current_dir(dir.path())
         .output()
         .unwrap();
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
+        stderr.contains("sherpa: issue #123 in owner/repo at "),
+        "{stderr}"
+    );
+    assert!(
         stderr.contains("pipeline orchestration is not implemented yet"),
         "{stderr}"
     );
+}
+
+#[test]
+fn cli_requires_current_git_origin() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sherpa"))
+        .arg("123")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("current directory must be inside a git repository"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn cli_does_not_echo_unsupported_origin_url() {
+    let dir = tempfile::tempdir().unwrap();
+    run_git(&["init"], dir.path());
+    run_git(
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://token@example.com/owner/repo.git",
+        ],
+        dir.path(),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sherpa"))
+        .arg("123")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("git origin remote must be a github.com owner/repo URL"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("token"), "{stderr}");
+    assert!(!stderr.contains("example.com"), "{stderr}");
 }
 
 #[test]
@@ -259,6 +319,20 @@ fn load_prompt_unterminated_placeholder() {
     let vars = HashMap::from([("name", "Alice")]);
     let out = load_prompt("test.md", dir.path(), &vars).unwrap();
     assert_eq!(out, "Hello {{name");
+}
+
+fn run_git(args: &[&str], cwd: &Path) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
