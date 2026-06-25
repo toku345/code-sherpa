@@ -160,7 +160,12 @@ fn is_github_host(host: &str) -> bool {
 }
 
 fn is_valid_repo_segment(segment: &str) -> bool {
-    !segment.is_empty() && segment != "." && segment != ".." && !segment.contains(':')
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
@@ -214,6 +219,11 @@ mod tests {
         );
         assert_eq!(
             parse_repo_slug("ssh://git@github.example.com/owner/repo.git"),
+            None
+        );
+        assert_eq!(parse_repo_slug("git@github.com:owner@evil/repo.git"), None);
+        assert_eq!(
+            parse_repo_slug("https://github.com/owner/repo@evil.git"),
             None
         );
     }
