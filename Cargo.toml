@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Pipeline manager for automated coding — guides GitHub Issues from detection to merge"
 readme = "README.md"
+autobins = false
+
+[[bin]]
+name = "sherpa"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

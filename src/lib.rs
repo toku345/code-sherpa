@@ -89,10 +89,15 @@ pub struct PipelineContext {
 
 impl PipelineContext {
     /// Create a context for `issue_number` in `repo` (`owner/repo`).
-    pub fn new(issue_number: u64, repo: impl Into<String>) -> Self {
+    pub fn new(
+        issue_number: u64,
+        repo: impl Into<String>,
+        worktree_path: impl Into<String>,
+    ) -> Self {
         Self {
             issue_number,
             repo: repo.into(),
+            worktree_path: worktree_path.into(),
             ..Self::default()
         }
     }
