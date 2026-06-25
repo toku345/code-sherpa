@@ -255,6 +255,36 @@ fn cli_requires_current_git_origin() {
 }
 
 #[test]
+fn cli_does_not_echo_unsupported_origin_url() {
+    let dir = tempfile::tempdir().unwrap();
+    run_git(&["init"], dir.path());
+    run_git(
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://token@example.com/owner/repo.git",
+        ],
+        dir.path(),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sherpa"))
+        .arg("123")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("git origin remote must be a github.com owner/repo URL"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("token"), "{stderr}");
+    assert!(!stderr.contains("example.com"), "{stderr}");
+}
+
+#[test]
 fn load_prompt_substitution() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.md"), "Hello {{name}}, issue #{{num}}").unwrap();

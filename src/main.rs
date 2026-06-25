@@ -37,12 +37,8 @@ fn resolve_context(issue_number: u64) -> anyhow::Result<PipelineContext> {
 fn resolve_context_from(issue_number: u64, cwd: &Path) -> anyhow::Result<PipelineContext> {
     let repo_root = resolve_repo_root(cwd)?;
     let remote_url = read_origin_remote(&repo_root)?;
-    let repo = parse_repo_slug(&remote_url).with_context(|| {
-        format!(
-            "git origin remote is not a supported owner/repo URL: {}",
-            remote_url.trim()
-        )
-    })?;
+    let repo = parse_repo_slug(&remote_url)
+        .context("git origin remote must be a github.com owner/repo URL")?;
 
     Ok(PipelineContext::new(
         issue_number,
@@ -99,14 +95,21 @@ fn parse_repo_slug(remote_url: &str) -> Option<String> {
         return None;
     }
 
-    let path = if is_scp_like_remote(remote_url) {
-        remote_url.split_once(':')?.1
+    let path = if let Some((authority, path)) = scp_like_remote_parts(remote_url) {
+        if !is_github_host(scp_like_host(authority)?) {
+            return None;
+        }
+        path
     } else if let Some(scheme_end) = remote_url.find("://") {
         let without_scheme = &remote_url[scheme_end + 3..];
         let path_start = without_scheme.find('/')?;
+        let authority = &without_scheme[..path_start];
+        if !is_github_host(url_authority_host(authority)?) {
+            return None;
+        }
         &without_scheme[path_start + 1..]
     } else {
-        remote_url
+        return None;
     };
 
     if path.contains(['?', '#', '\\']) {
@@ -129,11 +132,31 @@ fn parse_repo_slug(remote_url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-fn is_scp_like_remote(remote_url: &str) -> bool {
-    let Some((authority, _path)) = remote_url.split_once(':') else {
-        return false;
-    };
-    authority.contains('@') && !authority.contains('/')
+fn scp_like_remote_parts(remote_url: &str) -> Option<(&str, &str)> {
+    let (authority, path) = remote_url.split_once(':')?;
+    if authority.contains('@') && !authority.contains('/') {
+        Some((authority, path))
+    } else {
+        None
+    }
+}
+
+fn scp_like_host(authority: &str) -> Option<&str> {
+    authority.rsplit_once('@').map(|(_user, host)| host)
+}
+
+fn url_authority_host(authority: &str) -> Option<&str> {
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_user, host)| host);
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some(host)
+}
+
+fn is_github_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("github.com")
 }
 
 fn is_valid_repo_segment(segment: &str) -> bool {
@@ -161,7 +184,7 @@ mod tests {
             Some("owner/repo".to_owned())
         );
         assert_eq!(
-            parse_repo_slug("git@github.example.com:owner/repo"),
+            parse_repo_slug("https://token@github.com/owner/repo.git"),
             Some("owner/repo".to_owned())
         );
     }
@@ -181,6 +204,16 @@ mod tests {
         );
         assert_eq!(
             parse_repo_slug("https://github.com/org/team/repo.git"),
+            None
+        );
+        assert_eq!(parse_repo_slug("owner/repo"), None);
+        assert_eq!(parse_repo_slug("git@github.example.com:owner/repo"), None);
+        assert_eq!(
+            parse_repo_slug("https://github.example.com/owner/repo.git"),
+            None
+        );
+        assert_eq!(
+            parse_repo_slug("ssh://git@github.example.com/owner/repo.git"),
             None
         );
     }
@@ -252,7 +285,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("git origin remote is not a supported owner/repo URL"),
+                .contains("git origin remote must be a github.com owner/repo URL"),
             "{err:#}"
         );
     }
