@@ -9,7 +9,7 @@ cargo build                       # ビルド
 cargo fmt --all --check           # フォーマットチェック（--check を外すと整形）
 cargo clippy --all-targets -- -D warnings  # リンター
 cargo test --all                  # テスト
-cargo run -- <issue_number> --repo <owner/repo>  # 実行
+cargo run --bin sherpa -- <issue_number>  # 実行
 ```
 
 ## ドキュメント
