@@ -120,3 +120,13 @@ push + `gh pr create` は最初の不可逆な外部操作（CLAUDE.md outward-f
 - 逸脱: Step 5 の end-to-end fake integration test を成立させるため、PrCreation の dry-run 最小実装だけ Step 6 より先に入れた。push / `gh pr create` / 既存 PR 検出の本実装は Step 6 で追加した。
 - トレードオフ: 観察ログの `timestamp` は追加クレートを避けるため RFC3339 ではなく `unix_ms:<millis>` 文字列にした。ADR-005 の必須フィールドと raw/parsed verdict は JSONL に出力する。
 - トレードオフ: CLI の prompt directory は repo root の `docs/prompts` 固定にした。配布後に prompts をバイナリへ埋め込むか設定化する余地は残す。
+
+### 2026-06-26 review follow-up
+
+- 設計判断: デフォルト観察ログは repo root 直下ではなく、repo の兄弟 `.sherpa-worktrees/observations.jsonl` に置く。dry-run 実行だけで main worktree が dirty になり、BranchCreation の clean check と衝突するため。
+- 設計判断: BranchCreation で `base_ref` を immutable な `base_commit` に解決し、worktree 作成と CodeReview diff の両方で同じ commit を使う。publish 後でも `git diff --no-ext-diff <base_commit>` が最終差分を表すようにするため。
+- 設計判断: CodeReview には stat ではなく full diff を渡し、diff 取得失敗や空 diff は fail loud にした。レビュー agent が空/要約差分を approve してしまう false-green を避ける。
+- 設計判断: text verdict は「最初の非空行が `VERDICT: ...`」であることを必須にした。プロンプト契約と parser のズレをなくし、先頭以外の verdict 混入を拒否する。
+- 設計判断: `gh pr list` が要素を返したのに `url` が欠ける場合は `None` ではなく fail loud にする。既存 PR 検出の異常を新規 PR 作成で覆い隠さないため。
+- 設計判断: `PipelineOptions` は空の `test_commands` と空コマンド、`max_retries = 0` を実行前に拒否する。silent false-green を避けるため。
+- テスト判断: fake `gh`/`git`/`claude` に call log を追加し、dry-run で push/create しないこと、publish で add/commit/push/create すること、CodeReview が full diff を受け取ることを統合テストで固定した。

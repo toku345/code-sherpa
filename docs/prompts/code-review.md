@@ -24,7 +24,7 @@ Use exactly one of those first lines. After that, list concrete merge-blocking r
 
 {{plan}}
 
-## Diff Summary
+## Diff
 
 {{diff}}
 

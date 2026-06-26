@@ -86,6 +86,7 @@ pub struct PipelineContext {
     pub plan: String,
     pub worktree_path: String,
     pub branch_name: String,
+    pub base_commit: String,
     pub last_error: String,
 }
 
@@ -156,8 +157,12 @@ pub struct PipelineOptions {
 impl PipelineOptions {
     pub fn new(repo_root: impl Into<PathBuf>, prompts_dir: impl Into<PathBuf>) -> Self {
         let repo_root = repo_root.into();
+        let log_path = repo_root
+            .parent()
+            .map(|parent| parent.join(".sherpa-worktrees").join("observations.jsonl"))
+            .unwrap_or_else(|| repo_root.join("sherpa-observations.jsonl"));
         Self {
-            log_path: repo_root.join(".sherpa-observations.jsonl"),
+            log_path,
             repo_root,
             prompts_dir: prompts_dir.into(),
             publish: false,
@@ -235,18 +240,28 @@ pub fn parse_review_verdict(raw: &str) -> Result<ReviewVerdict> {
         return parse_json_verdict(trimmed);
     }
 
-    let verdict_lines: Vec<_> = raw
+    let first_line = raw
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("VERDICT:").map(str::trim))
-        .collect();
-
-    let [decision] = verdict_lines.as_slice() else {
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| anyhow!("review verdict is empty"))?;
+    let Some(decision) = first_line.strip_prefix("VERDICT:").map(str::trim) else {
         bail!(
-            "review verdict must contain exactly one 'VERDICT: approve|reject|changes_requested' line"
+            "review verdict first non-empty line must be 'VERDICT: approve|reject|changes_requested'"
         );
     };
     let decision = ReviewDecision::parse(decision)
         .ok_or_else(|| anyhow!("unknown review verdict: {decision}"))?;
+    let verdict_count = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("VERDICT:"))
+        .count();
+    if verdict_count != 1 {
+        bail!(
+            "review verdict must contain exactly one 'VERDICT: approve|reject|changes_requested' line"
+        );
+    }
 
     let reasons = raw
         .lines()
@@ -287,6 +302,7 @@ pub fn run_pipeline(
     mut ctx: PipelineContext,
     options: &PipelineOptions,
 ) -> Result<PipelineOutcome> {
+    validate_options(options)?;
     let mut retries: HashMap<&'static str, u8> = HashMap::new();
 
     run_issue_fetch(&mut ctx, options)?;
@@ -343,6 +359,19 @@ pub fn run_pipeline(
     })
 }
 
+fn validate_options(options: &PipelineOptions) -> Result<()> {
+    if options.max_retries == 0 {
+        bail!("PipelineOptions max_retries must be greater than zero");
+    }
+    if options.test_commands.is_empty() {
+        bail!("PipelineOptions test_commands must not be empty");
+    }
+    if options.test_commands.iter().any(Vec::is_empty) {
+        bail!("PipelineOptions test_commands must not contain empty commands");
+    }
+    Ok(())
+}
+
 fn record_retry(
     options: &PipelineOptions,
     stage: Stage,
@@ -392,6 +421,10 @@ fn log_stage(options: &PipelineOptions, log: StageLog<'_>) -> Result<()> {
         entry["parsed_verdict"] = json!(null);
     }
 
+    if let Some(parent) = options.log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create observation log dir {}", parent.display()))?;
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -526,6 +559,19 @@ fn run_branch_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> 
     }
 
     let branch_name = format!("sherpa/issue-{}", ctx.issue_number);
+    let base_commit = run_cmd(
+        &[
+            "git",
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", options.base_ref),
+        ],
+        Some(&options.repo_root),
+        options.command_timeout,
+    )
+    .context("BranchCreation failed to resolve base commit")?
+    .trim()
+    .to_owned();
     let worktree_parent = options
         .repo_root
         .parent()
@@ -552,7 +598,7 @@ fn run_branch_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> 
             worktree_arg,
             "-b",
             &branch_name,
-            &options.base_ref,
+            &base_commit,
         ],
         Some(&options.repo_root),
         options.command_timeout,
@@ -560,6 +606,7 @@ fn run_branch_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> 
     .context("BranchCreation git worktree add failed")?;
 
     ctx.branch_name = branch_name;
+    ctx.base_commit = base_commit;
     ctx.worktree_path = worktree_path.display().to_string();
     log_stage(
         options,
@@ -571,7 +618,8 @@ fn run_branch_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> 
             output_summary: Some(json!({
                 "branch": ctx.branch_name,
                 "worktree_path": ctx.worktree_path,
-                "base_ref": options.base_ref
+                "base_ref": options.base_ref,
+                "base_commit": ctx.base_commit
             })),
             error: None,
             verdict: None,
@@ -746,11 +794,19 @@ fn find_existing_pr(ctx: &PipelineContext, options: &PipelineOptions) -> Result<
     let Some(items) = data.as_array() else {
         bail!("PrCreation existing PR JSON must be an array");
     };
-    Ok(items.first().and_then(|item| {
-        item.get("url")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-    }))
+    let Some(item) = items.first() else {
+        return Ok(None);
+    };
+    let url = item
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "PrCreation existing PR item missing string url: {}",
+                truncate(&item.to_string(), 200)
+            )
+        })?;
+    Ok(Some(url.to_owned()))
 }
 
 fn log_pr_creation(
@@ -826,11 +882,14 @@ fn log_pr_creation(
 fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<ReviewVerdict> {
     let worktree = Path::new(&ctx.worktree_path);
     let diff = run_cmd(
-        &["git", "diff", "--stat", &options.base_ref],
+        &["git", "diff", "--no-ext-diff", &ctx.base_commit],
         Some(worktree),
         options.command_timeout,
     )
-    .unwrap_or_else(|err| format!("diff unavailable: {err:#}"));
+    .context("CodeReview failed to collect worktree diff")?;
+    if diff.trim().is_empty() {
+        bail!("CodeReview collected an empty diff");
+    }
     let issue_number = ctx.issue_number.to_string();
     let vars = HashMap::from([
         ("issue_number", issue_number.as_str()),
