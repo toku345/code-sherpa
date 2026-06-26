@@ -58,6 +58,7 @@ fn pipeline_options_default_log_path_stays_outside_repo() {
         dir.path().join(".sherpa-worktrees/observations.jsonl")
     );
     assert!(!options.log_path.starts_with(&repo));
+    assert_eq!(options.base_ref, "origin/main");
 }
 
 #[test]
@@ -370,6 +371,16 @@ fn pipeline_happy_path_with_fake_tools_dry_runs_pr_and_reviews_code() {
 
     let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
     assert!(calls.contains("gh pr list"), "{calls}");
+    assert!(
+        calls.contains("git fetch --quiet origin refs/heads/main"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("git worktree add ")
+            && calls.contains(" -b sherpa/issue-10 0123456789abcdef0123456789abcdef01234567"),
+        "{calls}"
+    );
+    assert!(calls.contains("git add --intent-to-add ."), "{calls}");
     assert!(calls.contains("git diff --no-ext-diff 0123456789abcdef0123456789abcdef01234567"));
     assert!(!calls.contains("git add -A"), "{calls}");
     assert!(!calls.contains("git commit"), "{calls}");
@@ -572,6 +583,35 @@ fn pipeline_publish_mode_creates_pr_when_none_exists() {
         "{calls}"
     );
     assert!(calls.contains("gh pr create"), "{calls}");
+    assert!(calls.contains("--base main"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_fails_loud_when_issue_body_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::MissingIssueBody, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("IssueFetch JSON missing string field 'body'"),
+        "{err:#}"
+    );
 }
 
 #[cfg(unix)]
@@ -815,6 +855,7 @@ enum FakeScenario {
     RejectThenApprovePlan,
     ExistingPr,
     MalformedExistingPr,
+    MissingIssueBody,
     CodeReviewChanges,
 }
 
@@ -830,7 +871,14 @@ if [ -n "${SHERPA_CALL_LOG:-}" ]; then
   printf 'gh %s\n' "$*" >> "$SHERPA_CALL_LOG"
 fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  printf '{"title":"Pipeline issue","body":"Implement the skeleton"}'
+  case "${SHERPA_SCENARIO:-happy}" in
+    missing_issue_body)
+      printf '{"title":"Pipeline issue"}'
+      ;;
+    *)
+      printf '{"title":"Pipeline issue","body":"Implement the skeleton"}'
+      ;;
+  esac
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
@@ -869,12 +917,34 @@ if [ "$1" = "status" ] && [ "$2" = "--porcelain" ]; then
   esac
   exit 0
 fi
+if [ "$1" = "fetch" ] && [ "$2" = "--quiet" ] && [ "$3" = "origin" ]; then
+  if [ "$4" != "refs/heads/main" ]; then
+    printf 'unexpected fetch args: %s\n' "$*" >&2
+    exit 1
+  fi
+  exit 0
+fi
 if [ "$1" = "rev-parse" ] && [ "$2" = "--verify" ]; then
   printf '0123456789abcdef0123456789abcdef01234567\n'
   exit 0
 fi
 if [ "$1" = "worktree" ] && [ "$2" = "add" ]; then
+  case "$5" in
+    sherpa/issue-*) ;;
+    *)
+      printf 'unexpected worktree branch: %s\n' "$*" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$4" != "-b" ] || [ "$6" != "0123456789abcdef0123456789abcdef01234567" ]; then
+    printf 'unexpected worktree add args: %s\n' "$*" >&2
+    exit 1
+  fi
   mkdir -p "$3"
+  exit 0
+fi
+if [ "$1" = "add" ] && [ "$2" = "--intent-to-add" ] && [ "$3" = "." ]; then
+  touch "$SHERPA_FAKE_ROOT/intent-to-add"
   exit 0
 fi
 if [ "$1" = "add" ]; then
@@ -890,6 +960,9 @@ if [ "$1" = "diff" ]; then
   if [ "$2" != "--no-ext-diff" ] || [ "$3" != "0123456789abcdef0123456789abcdef01234567" ]; then
     printf 'unexpected diff args: %s\n' "$*" >&2
     exit 1
+  fi
+  if [ ! -e "$SHERPA_FAKE_ROOT/intent-to-add" ]; then
+    exit 0
   fi
   printf '%s\n' \
     'diff --git a/implemented.txt b/implemented.txt' \
@@ -908,6 +981,7 @@ exec /usr/bin/git "$@"
         FakeScenario::Happy
         | FakeScenario::ExistingPr
         | FakeScenario::MalformedExistingPr
+        | FakeScenario::MissingIssueBody
         | FakeScenario::CodeReviewChanges => r#"VERDICT: approve\nplan ok"#,
         FakeScenario::RejectPlan => r#"VERDICT: reject\nplan too broad"#,
         FakeScenario::RejectThenApprovePlan => r#"dynamic"#,
@@ -1015,6 +1089,7 @@ exit 0
         FakeScenario::RejectThenApprovePlan => "reject_then_approve_plan",
         FakeScenario::ExistingPr => "existing_pr",
         FakeScenario::MalformedExistingPr => "malformed_existing_pr",
+        FakeScenario::MissingIssueBody => "missing_issue_body",
         FakeScenario::CodeReviewChanges => "code_review_changes",
     };
 

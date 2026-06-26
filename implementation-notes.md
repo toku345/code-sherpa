@@ -9,7 +9,7 @@ GitHub Issue #10「pipeline happy-path stages」の **Rust 版 walking skeleton*
 - 旧 `feat/pipeline-happy-path` ブランチは **Rust 移行前の Python 実装**（`pipeline.py`、merge-base が uv/mypy 時代）。main の Rust 移行に置換済みの死んだ枝。流用しない。設計スペック commit `b57c29b` に流用できる記述があるかは任意確認。
 - 本ブランチ `feat/pipeline-walking-skeleton` は現 main（Rust primitives + CLI skeleton）起点。
 
-## 起点の事実
+## 起点の事実（実装開始前）
 
 - `src/lib.rs`: primitives — `run_cmd` / `run_agent`（`claude -p --output-format json` を stdin プロンプト起動、`result` 文字列を返す）/ `parse_agent_output` / `load_prompt`（`{{var}}` 置換）/ `Stage` enum（8種）/ `PipelineContext`。subprocess は timeout・プロセスグループ kill・pipe ドレイン済み。
 - `src/main.rs`: issue 番号を受け、`git rev-parse` ＋ origin remote から `owner/repo` を解決（github.com 限定・slug 検証）。`main()` は `"pipeline orchestration is not implemented yet"` で意図的に bail。
@@ -128,5 +128,8 @@ push + `gh pr create` は最初の不可逆な外部操作（CLAUDE.md outward-f
 - 設計判断: CodeReview には stat ではなく full diff を渡し、diff 取得失敗や空 diff は fail loud にした。レビュー agent が空/要約差分を approve してしまう false-green を避ける。
 - 設計判断: text verdict は「最初の非空行が `VERDICT: ...`」であることを必須にした。プロンプト契約と parser のズレをなくし、先頭以外の verdict 混入を拒否する。
 - 設計判断: `gh pr list` が要素を返したのに `url` が欠ける場合は `None` ではなく fail loud にする。既存 PR 検出の異常を新規 PR 作成で覆い隠さないため。
+- 設計判断: CodeReview 前に isolated worktree で `git add --intent-to-add .` を実行し、未追跡の新規ファイルも `git diff --no-ext-diff <base_commit>` に含める。dry-run でもレビュー範囲から新規ファイルを落とさないため。
+- 設計判断: CLI のデフォルト base は `origin/main` とし、BranchCreation で `origin/main` を fetch して `FETCH_HEAD` を immutable commit に解決する。PR 作成時も `--base main` を渡し、worktree 作成・CodeReview・GitHub PR の base を揃える。`base_ref` が `origin/<branch>` でない場合は PR base を推測せず fail loud にする。
+- 設計判断: `gh issue view --json title,body` の `body` は missing / non-string を空文字に潰さず fail loud にする。空の issue body は `body: ""` として明示的に返った場合のみ許容する。
 - 設計判断: `PipelineOptions` は空の `test_commands` と空コマンド、`max_retries = 0` を実行前に拒否する。silent false-green を避けるため。
 - テスト判断: fake `gh`/`git`/`claude` に call log を追加し、dry-run で push/create しないこと、publish で add/commit/push/create すること、CodeReview が full diff を受け取ることを統合テストで固定した。

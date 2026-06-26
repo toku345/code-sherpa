@@ -169,7 +169,7 @@ impl PipelineOptions {
             max_retries: 3,
             command_timeout: DEFAULT_CMD_TIMEOUT,
             agent_timeout: DEFAULT_AGENT_TIMEOUT,
-            base_ref: "HEAD".to_owned(),
+            base_ref: "origin/main".to_owned(),
             test_commands: vec![
                 vec![
                     "cargo".into(),
@@ -474,8 +474,9 @@ fn run_issue_fetch(ctx: &mut PipelineContext, options: &PipelineOptions) -> Resu
         .to_owned();
     ctx.issue_body = data
         .get("body")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
+        .ok_or_else(|| anyhow!("IssueFetch JSON missing string field 'body'"))?
+        .as_str()
+        .ok_or_else(|| anyhow!("IssueFetch JSON missing string field 'body'"))?
         .to_owned();
     log_stage(
         options,
@@ -559,19 +560,7 @@ fn run_branch_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> 
     }
 
     let branch_name = format!("sherpa/issue-{}", ctx.issue_number);
-    let base_commit = run_cmd(
-        &[
-            "git",
-            "rev-parse",
-            "--verify",
-            &format!("{}^{{commit}}", options.base_ref),
-        ],
-        Some(&options.repo_root),
-        options.command_timeout,
-    )
-    .context("BranchCreation failed to resolve base commit")?
-    .trim()
-    .to_owned();
+    let base_commit = resolve_base_commit(options)?;
     let worktree_parent = options
         .repo_root
         .parent()
@@ -716,6 +705,8 @@ fn run_pr_creation(ctx: &PipelineContext, options: &PipelineOptions) -> Result<O
             ctx.repo.clone(),
             "--head".to_owned(),
             ctx.branch_name.clone(),
+            "--base".to_owned(),
+            pr_base_branch(options)?.to_owned(),
             "--title".to_owned(),
             title.clone(),
             "--body".to_owned(),
@@ -842,6 +833,8 @@ fn log_pr_creation(
         ctx.repo.clone(),
         "--head".to_owned(),
         ctx.branch_name.clone(),
+        "--base".to_owned(),
+        pr_base_branch(options)?.to_owned(),
         "--title".to_owned(),
         title.to_owned(),
         "--body".to_owned(),
@@ -881,6 +874,12 @@ fn log_pr_creation(
 
 fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<ReviewVerdict> {
     let worktree = Path::new(&ctx.worktree_path);
+    run_cmd(
+        &["git", "add", "--intent-to-add", "."],
+        Some(worktree),
+        options.command_timeout,
+    )
+    .context("CodeReview failed to mark untracked files for diff")?;
     let diff = run_cmd(
         &["git", "diff", "--no-ext-diff", &ctx.base_commit],
         Some(worktree),
@@ -915,6 +914,65 @@ fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
         },
     )?;
     Ok(verdict)
+}
+
+fn resolve_base_commit(options: &PipelineOptions) -> Result<String> {
+    if let Some(branch) = origin_base_branch(options)? {
+        run_cmd(
+            &[
+                "git",
+                "fetch",
+                "--quiet",
+                "origin",
+                &format!("refs/heads/{branch}"),
+            ],
+            Some(&options.repo_root),
+            options.command_timeout,
+        )
+        .with_context(|| format!("BranchCreation failed to fetch origin/{branch}"))?;
+        return run_cmd(
+            &["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+            Some(&options.repo_root),
+            options.command_timeout,
+        )
+        .context("BranchCreation failed to resolve fetched base commit")
+        .map(|output| output.trim().to_owned());
+    }
+
+    run_cmd(
+        &[
+            "git",
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", options.base_ref),
+        ],
+        Some(&options.repo_root),
+        options.command_timeout,
+    )
+    .context("BranchCreation failed to resolve base commit")
+    .map(|output| output.trim().to_owned())
+}
+
+fn pr_base_branch(options: &PipelineOptions) -> Result<&str> {
+    origin_base_branch(options)?.ok_or_else(|| {
+        anyhow!("PipelineOptions base_ref must be an origin/<branch> ref for PR creation")
+    })
+}
+
+fn origin_base_branch(options: &PipelineOptions) -> Result<Option<&str>> {
+    let Some(branch) = options.base_ref.strip_prefix("origin/") else {
+        return Ok(None);
+    };
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || branch.starts_with('+')
+        || branch.contains(':')
+        || branch.contains("..")
+        || branch.contains('\\')
+    {
+        bail!("PipelineOptions base_ref must be a safe origin branch ref");
+    }
+    Ok(Some(branch))
 }
 
 fn verify_agent_runtime(cwd: &Path, options: &PipelineOptions) -> Result<()> {
