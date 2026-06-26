@@ -1211,7 +1211,13 @@ fn redacted_argv(cmd: &[String]) -> String {
 /// returning the agent's `result` field.
 pub fn run_agent(prompt: &str, cwd: Option<&Path>, timeout: Duration) -> Result<String> {
     let mut command = Command::new("claude");
-    command.args(["-p", "--output-format", "json"]);
+    command.args([
+        "-p",
+        "--safe-mode",
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+    ]);
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
@@ -1224,15 +1230,38 @@ pub fn run_agent(prompt: &str, cwd: Option<&Path>, timeout: Duration) -> Result<
 pub fn parse_agent_output(stdout: &str) -> Result<String> {
     let data: serde_json::Value = serde_json::from_str(stdout)
         .map_err(|_| anyhow!("claude: invalid JSON: {}", truncate(stdout, 200)))?;
-    match data.get("result") {
-        Some(serde_json::Value::String(s)) => Ok(s.clone()),
-        Some(other) => bail!(
-            "claude: 'result' must be a string, got {}: {}",
-            json_value_kind(other),
-            truncate(stdout, 200)
-        ),
-        None => bail!("claude: missing 'result' key: {}", truncate(stdout, 200)),
+    if let Some(result) = data.get("result") {
+        return match result {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            other => bail!(
+                "claude: 'result' must be a string, got {}: {}",
+                json_value_kind(other),
+                truncate(stdout, 200)
+            ),
+        };
     }
+
+    if let Some(items) = data.as_array() {
+        let result = items
+            .iter()
+            .rev()
+            .find(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+            .ok_or_else(|| anyhow!("claude: missing result event: {}", truncate(stdout, 200)))?;
+        return match result.get("result") {
+            Some(serde_json::Value::String(s)) => Ok(s.clone()),
+            Some(other) => bail!(
+                "claude: result event 'result' must be a string, got {}: {}",
+                json_value_kind(other),
+                truncate(stdout, 200)
+            ),
+            None => bail!(
+                "claude: result event missing 'result' key: {}",
+                truncate(stdout, 200)
+            ),
+        };
+    }
+
+    bail!("claude: missing 'result' key: {}", truncate(stdout, 200))
 }
 
 fn json_value_kind(value: &serde_json::Value) -> &'static str {

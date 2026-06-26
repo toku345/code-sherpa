@@ -151,7 +151,7 @@ printf '{"result":"agent done"}'
     );
     assert_eq!(
         std::fs::read_to_string(work.path().join("args.txt")).unwrap(),
-        "-p\n--output-format\njson\n"
+        "-p\n--safe-mode\n--output-format\njson\n--no-session-persistence\n"
     );
 }
 
@@ -188,6 +188,13 @@ sleep 5
 #[test]
 fn parse_agent_output_success() {
     assert_eq!(parse_agent_output(r#"{"result": "done"}"#).unwrap(), "done");
+}
+
+#[test]
+fn parse_agent_output_success_from_transcript_result_event() {
+    let stdout = r#"[{"type":"system"},{"type":"assistant","message":{"content":[{"type":"text","text":"ignored"}]}},{"type":"result","result":"done"}]"#;
+
+    assert_eq!(parse_agent_output(stdout).unwrap(), "done");
 }
 
 #[test]
