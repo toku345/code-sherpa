@@ -9,7 +9,10 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use code_sherpa::{PipelineContext, Stage, load_prompt, parse_agent_output, run_agent, run_cmd};
+use code_sherpa::{
+    PipelineContext, PipelineOptions, ReviewDecision, Stage, load_prompt, parse_agent_output,
+    parse_review_verdict, run_agent, run_cmd, run_pipeline,
+};
 
 #[cfg(unix)]
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -210,30 +213,215 @@ fn parse_agent_output_rejects_non_string_result() {
 }
 
 #[test]
-fn cli_fails_until_pipeline_orchestration_exists() {
+fn parse_review_verdict_accepts_contract_line() {
+    let verdict = parse_review_verdict("VERDICT: reject\nMissing tests").unwrap();
+
+    assert_eq!(verdict.decision, ReviewDecision::Reject);
+    assert_eq!(verdict.reasons, ["Missing tests"]);
+}
+
+#[test]
+fn parse_review_verdict_accepts_json_contract() {
+    let verdict =
+        parse_review_verdict(r#"{"verdict":"changes_requested","reasons":["fix lint"]}"#).unwrap();
+
+    assert_eq!(verdict.decision, ReviewDecision::ChangesRequested);
+    assert_eq!(verdict.reasons, ["fix lint"]);
+}
+
+#[test]
+fn parse_review_verdict_fails_closed_on_ambiguous_text() {
+    let err = parse_review_verdict("I cannot approve; reject this plan").unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("must contain exactly one 'VERDICT: approve|reject|changes_requested'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn parse_review_verdict_fails_closed_on_multiple_verdicts() {
+    let err = parse_review_verdict("VERDICT: approve\nVERDICT: reject").unwrap_err();
+
+    assert!(err.to_string().contains("exactly one 'VERDICT"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_happy_path_with_fake_tools_dry_runs_pr_and_reviews_code() {
     let dir = tempfile::tempdir().unwrap();
-    run_git(&["init"], dir.path());
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let log_path = dir.path().join("observations.jsonl");
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = log_path.clone();
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let result = with_fake_pipeline_tools(dir.path(), FakeScenario::Happy, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap();
+
+    assert!(result.dry_run);
+    assert_eq!(
+        result.code_review.unwrap().decision,
+        ReviewDecision::Approve
+    );
+    assert_eq!(result.context.issue_title, "Pipeline issue");
+    assert_eq!(result.context.branch_name, "sherpa/issue-10");
+    assert!(
+        Path::new(&result.context.worktree_path)
+            .join("implemented.txt")
+            .exists()
+    );
+
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("\"stage\":\"issue_fetch\""), "{log}");
+    assert!(log.contains("\"stage\":\"code_review\""), "{log}");
+    assert!(
+        log.contains("\"raw_verdict_text\":\"VERDICT: approve"),
+        "{log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_escalates_after_plan_review_reject_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::RejectPlan, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("pipeline escalated after 3 attempts on plan_review->plan_creation"),
+        "{err:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_escalates_after_test_fail_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-fail".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::Happy, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("pipeline escalated after 3 attempts on test_execution->implementation"),
+        "{err:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_publish_mode_pushes_and_reuses_existing_pr() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    options.publish = true;
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let result = with_fake_pipeline_tools(dir.path(), FakeScenario::ExistingPr, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap();
+
+    assert!(!result.dry_run);
+    assert_eq!(
+        result.pr_url.as_deref(),
+        Some("https://github.com/owner/repo/pull/7")
+    );
+}
+
+#[test]
+fn cli_runs_pipeline_in_dry_run_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let prompts = repo.join("docs/prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(prompts.join("plan.md"), "planning agent {{issue_title}}").unwrap();
+    std::fs::write(
+        prompts.join("plan-review.md"),
+        "Review the proposed implementation plan {{plan}}",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("implement.md"),
+        "Implement the following plan {{plan}} {{last_error}}",
+    )
+    .unwrap();
+    std::fs::write(prompts.join("code-review.md"), "code review agent {{diff}}").unwrap();
+    run_git(&["init"], &repo);
     run_git(
         &["remote", "add", "origin", "git@github.com:owner/repo.git"],
-        dir.path(),
+        &repo,
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sherpa"))
-        .arg("123")
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    let output = with_fake_pipeline_tools(dir.path(), FakeScenario::Happy, || {
+        Command::new(env!("CARGO_BIN_EXE_sherpa"))
+            .arg("123")
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+    });
 
-    assert!(!output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("sherpa: issue #123 in owner/repo at "),
+        stderr.contains("sherpa: issue #123 in owner/repo completed through code_review"),
         "{stderr}"
     );
-    assert!(
-        stderr.contains("pipeline orchestration is not implemented yet"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("dry_run=true"), "{stderr}");
+    assert!(stderr.contains("code_review: Approve"), "{stderr}");
 }
 
 #[test]
@@ -361,6 +549,157 @@ fn load_prompt_resumes_after_invalid_placeholder() {
     let vars = HashMap::from([("name", "Alice")]);
     let out = load_prompt("test.md", dir.path(), &vars).unwrap();
     assert_eq!(out, "{{ bad }}Alice");
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum FakeScenario {
+    Happy,
+    RejectPlan,
+    ExistingPr,
+}
+
+#[cfg(unix)]
+fn with_fake_pipeline_tools<T>(root: &Path, scenario: FakeScenario, f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let bin_dir = root.join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    write_executable(
+        &bin_dir.join("gh"),
+        r#"#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  printf '{"title":"Pipeline issue","body":"Implement the skeleton"}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  if [ "${SHERPA_EXISTING_PR:-}" = "1" ]; then
+    printf '[{"number":7,"url":"https://github.com/owner/repo/pull/7"}]'
+  else
+    printf '[]'
+  fi
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  printf 'https://github.com/owner/repo/pull/8\n'
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+"#,
+    );
+    write_executable(
+        &bin_dir.join("git"),
+        r#"#!/bin/sh
+if [ "$1" = "status" ] && [ "$2" = "--porcelain" ]; then
+  case "$PWD" in
+    */.sherpa-worktrees/*)
+      printf '?? implemented.txt\n'
+      ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "worktree" ] && [ "$2" = "add" ]; then
+  mkdir -p "$3"
+  exit 0
+fi
+if [ "$1" = "add" ]; then
+  exit 0
+fi
+if [ "$1" = "commit" ]; then
+  exit 0
+fi
+if [ "$1" = "push" ]; then
+  exit 0
+fi
+if [ "$1" = "diff" ]; then
+  printf 'src/lib.rs | 1 +\n'
+  exit 0
+fi
+exec /usr/bin/git "$@"
+"#,
+    );
+    let plan_review = match scenario {
+        FakeScenario::Happy | FakeScenario::ExistingPr => r#"VERDICT: approve\nplan ok"#,
+        FakeScenario::RejectPlan => r#"VERDICT: reject\nplan too broad"#,
+    };
+    write_executable(
+        &bin_dir.join("claude"),
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'claude-test\n'
+  exit 0
+fi
+prompt=$(cat)
+case "$prompt" in
+  *"planning agent"*)
+    printf '%s' '{{"result":"plan v1"}}'
+    ;;
+  *"Review the proposed implementation plan"*)
+    printf '%s' '{{"result":"{plan_review}"}}'
+    ;;
+  *"Implement the following plan"*)
+    printf 'implemented\n' > implemented.txt
+    printf '%s' '{{"result":"implemented"}}'
+    ;;
+  *"code review agent"*)
+    printf '%s' '{{"result":"VERDICT: approve\ncode ok"}}'
+    ;;
+  *)
+    printf 'unexpected prompt\n' >&2
+    exit 1
+    ;;
+esac
+"#
+        ),
+    );
+    write_executable(
+        &bin_dir.join("gate-ok"),
+        r#"#!/bin/sh
+exit 0
+"#,
+    );
+    write_executable(
+        &bin_dir.join("gate-fail"),
+        r#"#!/bin/sh
+printf 'gate failed\n' >&2
+exit 1
+"#,
+    );
+    write_executable(
+        &bin_dir.join("cargo"),
+        r#"#!/bin/sh
+exit 0
+"#,
+    );
+
+    let old_path = std::env::var_os("PATH");
+    let mut paths = vec![bin_dir];
+    if let Some(path) = &old_path {
+        paths.extend(std::env::split_paths(path));
+    }
+    let new_path = std::env::join_paths(paths).unwrap();
+
+    // SAFETY: tests that mutate PATH are serialized by ENV_LOCK.
+    unsafe {
+        std::env::set_var("PATH", new_path);
+        if matches!(scenario, FakeScenario::ExistingPr) {
+            std::env::set_var("SHERPA_EXISTING_PR", "1");
+        } else {
+            std::env::remove_var("SHERPA_EXISTING_PR");
+        }
+    }
+    let result = f();
+    // SAFETY: tests that mutate PATH are serialized by ENV_LOCK.
+    unsafe {
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        std::env::remove_var("SHERPA_EXISTING_PR");
+    }
+
+    result
 }
 
 #[cfg(unix)]

@@ -109,3 +109,14 @@ push + `gh pr create` は最初の不可逆な外部操作（CLAUDE.md outward-f
 
 - プラン再レビューは不要（改訂は Codex blocker の直接反映）。
 - 実装完了後の **pre-PR gate は Codex `$pr-review`**（ターミナルからユーザーが起動、Claude 内から自走させない）。draft PR を先に作っておくと specialist が同じ base ref に収束する。
+
+## 実装メモ
+
+### 2026-06-26 walking skeleton 実装
+
+- 設計判断: `ReviewVerdict` は JSON 契約と `VERDICT: ...` 先頭行契約の両方を受けるが、自由文 substring 判定はしない。欠落・複数 verdict・未知値は fail loud。
+- 設計判断: retry は `plan_review->plan_creation` と `test_execution->implementation` の edge 単位で数え、3回目で escalation とする。
+- 設計判断: worktree は repo root の兄弟 `.sherpa-worktrees/issue-<n>` に作る。v0 では CodeReview 後の確認・dry-run inspection を優先して自動削除しない。
+- 逸脱: Step 5 の end-to-end fake integration test を成立させるため、PrCreation の dry-run 最小実装だけ Step 6 より先に入れた。push / `gh pr create` / 既存 PR 検出の本実装は Step 6 で追加した。
+- トレードオフ: 観察ログの `timestamp` は追加クレートを避けるため RFC3339 ではなく `unix_ms:<millis>` 文字列にした。ADR-005 の必須フィールドと raw/parsed verdict は JSONL に出力する。
+- トレードオフ: CLI の prompt directory は repo root の `docs/prompts` 固定にした。配布後に prompts をバイナリへ埋め込むか設定化する余地は残す。
