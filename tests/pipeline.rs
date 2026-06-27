@@ -166,7 +166,7 @@ printf '{"result":"agent done"}'
     );
     assert_eq!(
         std::fs::read_to_string(work.path().join("args.txt")).unwrap(),
-        "-p\n--safe-mode\n--output-format\njson\n--no-session-persistence\n"
+        "-p\n--output-format\njson\n--no-session-persistence\n"
     );
 }
 
@@ -184,6 +184,25 @@ exit 7
     .unwrap_err();
 
     assert!(err.to_string().starts_with("claude: agent failed"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_cmd_failure_includes_stdout_and_stderr() {
+    let err = run_cmd(
+        &[
+            "/bin/sh",
+            "-c",
+            "printf 'assertion failed\\n'; printf 'warning\\n' >&2; exit 1",
+        ],
+        None,
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
+    let message = err.to_string();
+
+    assert!(message.contains("stderr:\nwarning"), "{message}");
+    assert!(message.contains("stdout:\nassertion failed"), "{message}");
 }
 
 #[cfg(unix)]
@@ -278,6 +297,42 @@ fn parse_review_verdict_accepts_json_contract() {
 
     assert_eq!(verdict.decision, ReviewDecision::ChangesRequested);
     assert_eq!(verdict.reasons, ["fix lint"]);
+}
+
+#[test]
+fn parse_review_verdict_rejects_json_missing_verdict() {
+    let err = parse_review_verdict(r#"{"reasons":["fix lint"]}"#).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("must contain string field 'verdict'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn parse_review_verdict_rejects_json_unknown_verdict() {
+    let err = parse_review_verdict(r#"{"verdict":"maybe"}"#).unwrap_err();
+
+    assert!(err.to_string().contains("unknown review verdict"), "{err}");
+}
+
+#[test]
+fn parse_review_verdict_rejects_json_non_array_reasons() {
+    let err = parse_review_verdict(r#"{"verdict":"approve","reasons":"ok"}"#).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("JSON field 'reasons' must be an array"),
+        "{err}"
+    );
+}
+
+#[test]
+fn parse_review_verdict_rejects_json_non_string_reason() {
+    let err = parse_review_verdict(r#"{"verdict":"approve","reasons":[42]}"#).unwrap_err();
+
+    assert!(err.to_string().contains("reasons must be strings"), "{err}");
 }
 
 #[test]
@@ -644,7 +699,7 @@ fn pipeline_fails_loud_when_existing_pr_json_lacks_url() {
 
 #[cfg(unix)]
 #[test]
-fn pipeline_stops_after_code_review_changes_requested() {
+fn pipeline_fails_after_code_review_changes_requested() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -658,15 +713,15 @@ fn pipeline_stops_after_code_review_changes_requested() {
     options.agent_timeout = Duration::from_secs(10);
     let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
 
-    let result = with_fake_pipeline_tools(dir.path(), FakeScenario::CodeReviewChanges, || {
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::CodeReviewChanges, || {
         run_pipeline(ctx, &options)
     })
-    .unwrap();
+    .unwrap_err();
 
-    assert!(result.dry_run);
-    assert_eq!(
-        result.code_review.unwrap().decision,
-        ReviewDecision::ChangesRequested
+    assert!(
+        err.to_string()
+            .contains("CodeReview did not approve: changes_requested: fix code"),
+        "{err:#}"
     );
     let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
     assert!(!calls.contains("gh pr create"), "{calls}");
@@ -718,6 +773,63 @@ fn cli_runs_pipeline_in_dry_run_mode() {
     );
     assert!(stderr.contains("dry_run=true"), "{stderr}");
     assert!(stderr.contains("code_review: Approve"), "{stderr}");
+}
+
+#[test]
+fn cli_publish_flags_trigger_publish_mode() {
+    for flag in ["--publish", "--yes"] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let prompts = repo.join("docs/prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("plan.md"), "planning agent {{issue_title}}").unwrap();
+        std::fs::write(
+            prompts.join("plan-review.md"),
+            "Review the proposed implementation plan {{plan}}",
+        )
+        .unwrap();
+        std::fs::write(
+            prompts.join("implement.md"),
+            "Implement the following plan {{plan}} {{last_error}}",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("code-review.md"), "code review agent {{diff}}").unwrap();
+        run_git(&["init"], &repo);
+        run_git(
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+            &repo,
+        );
+
+        let output = with_fake_pipeline_tools(dir.path(), FakeScenario::Happy, || {
+            Command::new(env!("CARGO_BIN_EXE_sherpa"))
+                .arg("123")
+                .arg(flag)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        });
+
+        assert!(
+            output.status.success(),
+            "{flag} stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("dry_run=false"), "{stderr}");
+        assert!(
+            stderr.contains("pr: https://github.com/owner/repo/pull/8"),
+            "{stderr}"
+        );
+        let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+        assert!(
+            calls.contains("git push -u origin sherpa/issue-123"),
+            "{calls}"
+        );
+        assert!(calls.contains("gh pr create"), "{calls}");
+        assert!(calls.contains("--base main"), "{calls}");
+    }
 }
 
 #[test]

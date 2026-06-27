@@ -191,7 +191,7 @@ impl PipelineOptions {
     }
 }
 
-/// Final state returned after the v0 pipeline stops at CodeReview.
+/// Final state returned after the v0 pipeline passes CodeReview.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineOutcome {
     pub context: PipelineContext,
@@ -297,7 +297,7 @@ fn parse_json_verdict(raw: &str) -> Result<ReviewVerdict> {
     Ok(ReviewVerdict { decision, reasons })
 }
 
-/// Run the v0 walking skeleton. It stops after CodeReview and does not merge.
+/// Run the v0 walking skeleton. It passes CodeReview and does not merge.
 pub fn run_pipeline(
     mut ctx: PipelineContext,
     options: &PipelineOptions,
@@ -351,6 +351,18 @@ pub fn run_pipeline(
 
     let pr_url = run_pr_creation(&ctx, options)?;
     let review = run_code_review(&ctx, options)?;
+    if review.decision != ReviewDecision::Approve {
+        let reasons = if review.reasons.is_empty() {
+            "no reasons provided".to_owned()
+        } else {
+            review.reasons.join("; ")
+        };
+        bail!(
+            "CodeReview did not approve: {}: {}",
+            review.decision.as_str(),
+            reasons
+        );
+    }
     Ok(PipelineOutcome {
         context: ctx,
         code_review: Some(review),
@@ -906,7 +918,11 @@ fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
         StageLog {
             stage: Stage::CodeReview,
             attempt: 1,
-            outcome: StageOutcome::Success,
+            outcome: if verdict.decision == ReviewDecision::Approve {
+                StageOutcome::Success
+            } else {
+                StageOutcome::Failure
+            },
             input_summary: "review final worktree diff and stop",
             output_summary: Some(json!({ "decision": verdict.decision.as_str() })),
             error: None,
@@ -1088,12 +1104,7 @@ fn capture(
             if status.success() {
                 Ok(stdout)
             } else {
-                let detail = if stderr.trim().is_empty() {
-                    stdout
-                } else {
-                    stderr
-                };
-                bail!("{label}: {}", detail.trim())
+                bail!("{label}: {}", command_failure_detail(&stdout, &stderr))
             }
         }
         None => {
@@ -1109,6 +1120,17 @@ fn capture(
             }
             bail!("{label}: timed out after {}s", timeout.as_secs())
         }
+    }
+}
+
+fn command_failure_detail(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "command failed without output".to_owned(),
+        (false, true) => stdout.to_owned(),
+        (true, false) => stderr.to_owned(),
+        (false, false) => format!("command failed\nstderr:\n{stderr}\nstdout:\n{stdout}"),
     }
 }
 
@@ -1328,13 +1350,7 @@ fn redacted_argv(cmd: &[String]) -> String {
 /// returning the agent's `result` field.
 pub fn run_agent(prompt: &str, cwd: Option<&Path>, timeout: Duration) -> Result<String> {
     let mut command = Command::new("claude");
-    command.args([
-        "-p",
-        "--safe-mode",
-        "--output-format",
-        "json",
-        "--no-session-persistence",
-    ]);
+    command.args(["-p", "--output-format", "json", "--no-session-persistence"]);
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }

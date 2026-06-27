@@ -23,7 +23,7 @@ GitHub Issue #10「pipeline happy-path stages」の **Rust 版 walking skeleton*
 ## Constraints
 
 - アーキテクチャ不変（shell-kick / text-relay / 決定論 Manager）。新規クレートは原則追加しない（`gh`/`git` は subprocess、既存 primitives を再利用）。
-- 最終マージは自動化しない（design.md §1.2）。CodeReview は判定提示で停止し人間に委ねる。
+- 最終マージは自動化しない（design.md §1.2）。CodeReview は approve 以外を fail loud で停止し、人間に修正判断を委ねる。
 - fail loud。`origin` は github.com 限定の既存検証を踏襲。行数目標 400〜600 行（ADR-007）。
 
 ## ステージ構成（改訂版）
@@ -37,7 +37,7 @@ GitHub Issue #10「pipeline happy-path stages」の **Rust 版 walking skeleton*
 | Implementation | Agent A | 既存 `implement.md`（plan, last_error）を worktree cwd で実行 | ← Test fail |
 | TestExecution | Manager | 決め打ちゲートを順次実行（下記、コマンド注入可能に） | fail→Implementation（最大3→escalate） |
 | PrCreation | Manager | **dry-run default ＋ `--publish` gate**、push + `gh pr create`（one-shot） | — |
-| CodeReview | Agent B | `code-review.md`（新規）→ **判定提示して停止** | （v0 では changes ループ無し） |
+| CodeReview | Agent B | `code-review.md`（新規）→ **approve 以外は fail loud で停止** | （v0 では changes ループ無し） |
 
 ## 着手前に潰す blocker（Codex レビューで確定）
 
@@ -53,15 +53,15 @@ GitHub Issue #10「pipeline happy-path stages」の **Rust 版 walking skeleton*
 - 終了時 `git worktree remove`（成否に応じ cleanup / 保持を決める）。
 - `PipelineContext.worktree_path` を活用。ブランチ既存時の reuse/abort 規則と、開始前 `git status --porcelain` clean check も入れる。
 
-### 3. CodeReview は stop 確定、PrCreation は one-shot
+### 3. CodeReview は approve gate、PrCreation は one-shot
 changes→TestExecution で戻ると再び PrCreation に達し `gh pr create` が重複/失敗する。
-- **v0 は CodeReview を「判定提示して停止」に確定**し、changes フィードバック辺を v0 スコープから外す（冪等性問題を回避）。
+- **v0 は CodeReview の approve だけを成功扱い**にし、changes/reject は fail loud で人間に返す。changes フィードバック辺は v0 スコープから外す（冪等性問題を回避）。
 - changes ループ＋idempotent publish（`ctx.pr_number/pr_url` を持ち create-or-update）は後段。
 
 ### 4. PrCreation に publish gate
 push + `gh pr create` は最初の不可逆な外部操作（CLAUDE.md outward-facing 確認原則・着手前ゲート）。
 - **default は dry-run**、`--publish`/`--yes` を必須に。
-- publish 前に diff・branch・remote・PR title/body・実行 argv をログして gate。`gh pr create` 前に既存 PR 検出。
+- dry-run は branch・repo・PR title/body・実行 argv を観察ログに出す。実 publish は `--publish`/`--yes` を明示 gate とし、`gh pr create` 前に既存 PR を検出してから commit/push/create-or-reuse を実行する。
 
 ## 実装中に織り込む（Important / Minor）
 
@@ -133,3 +133,10 @@ push + `gh pr create` は最初の不可逆な外部操作（CLAUDE.md outward-f
 - 設計判断: `gh issue view --json title,body` の `body` は missing / non-string を空文字に潰さず fail loud にする。空の issue body は `body: ""` として明示的に返った場合のみ許容する。
 - 設計判断: `PipelineOptions` は空の `test_commands` と空コマンド、`max_retries = 0` を実行前に拒否する。silent false-green を避けるため。
 - テスト判断: fake `gh`/`git`/`claude` に call log を追加し、dry-run で push/create しないこと、publish で add/commit/push/create すること、CodeReview が full diff を受け取ることを統合テストで固定した。
+
+### 2026-06-27 review gate follow-up
+
+- 設計判断: 通常の `claude -p` 実行から `--safe-mode` を外した。machine-readable output は `--output-format json --no-session-persistence` で固定しつつ、repo/project guidance を無効化しないため。
+- 設計判断: CodeReview の `changes_requested` / `reject` は successful outcome として返さず、観察ログへ verdict を残したうえで `run_pipeline` が fail loud する。v0 では自動 changes ループを持たないが、merge-blocking review を exit 0 にしない。
+- 設計判断: subprocess failure は stdout/stderr の片方を捨てず、両方に内容がある場合は label 付きで error に含める。TestExecution retry の診断情報を落とさないため。
+- テスト判断: JSON verdict の schema 失敗、CLI `--publish` / `--yes` wiring、CodeReview 非 approve の fail loud を統合テストで固定した。
