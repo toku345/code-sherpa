@@ -727,6 +727,40 @@ fn pipeline_fails_after_code_review_changes_requested() {
     assert!(!calls.contains("gh pr create"), "{calls}");
 }
 
+#[cfg(unix)]
+#[test]
+fn pipeline_publish_mode_does_not_push_before_code_review_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    options.publish = true;
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::CodeReviewChanges, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("CodeReview did not approve: changes_requested: fix code"),
+        "{err:#}"
+    );
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(!calls.contains("git add -A"), "{calls}");
+    assert!(!calls.contains("git commit"), "{calls}");
+    assert!(!calls.contains("git push"), "{calls}");
+    assert!(!calls.contains("gh pr create"), "{calls}");
+}
+
 #[test]
 fn cli_runs_pipeline_in_dry_run_mode() {
     let dir = tempfile::tempdir().unwrap();

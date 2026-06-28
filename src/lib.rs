@@ -349,7 +349,6 @@ pub fn run_pipeline(
         }
     }
 
-    let pr_url = run_pr_creation(&ctx, options)?;
     let review = run_code_review(&ctx, options)?;
     if review.decision != ReviewDecision::Approve {
         let reasons = if review.reasons.is_empty() {
@@ -363,6 +362,7 @@ pub fn run_pipeline(
             reasons
         );
     }
+    let pr_url = run_pr_creation(&ctx, options)?;
     Ok(PipelineOutcome {
         context: ctx,
         code_review: Some(review),
