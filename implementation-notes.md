@@ -4,7 +4,7 @@
 
 ## これは何か
 
-GitHub Issue #10「pipeline happy-path stages」の **Rust 版 walking skeleton**。1つの Issue を `IssueFetch → … → PrCreation → CodeReview` まで end-to-end で1本通す決定論ステートマシンを実装する。
+GitHub Issue #10「pipeline happy-path stages」の **Rust 版 walking skeleton**。1つの Issue を `IssueFetch → … → CodeReview → PrCreation` まで end-to-end で1本通す決定論ステートマシンを実装する。
 
 - 旧 `feat/pipeline-happy-path` ブランチは **Rust 移行前の Python 実装**（`pipeline.py`、merge-base が uv/mypy 時代）。main の Rust 移行に置換済みの死んだ枝。流用しない。設計スペック commit `b57c29b` に流用できる記述があるかは任意確認。
 - 本ブランチ `feat/pipeline-walking-skeleton` は現 main（Rust primitives + CLI skeleton）起点。
@@ -145,3 +145,11 @@ push + `gh pr create` は最初の不可逆な外部操作（CLAUDE.md outward-f
 
 - 設計判断: `PrCreation` は CodeReview approve 後にだけ実行する。`--publish` であっても automated CodeReview が `changes_requested` / `reject` を返した場合、commit/push/PR create の外部副作用を出さずに fail loud する。
 - テスト判断: `publish = true` かつ CodeReview `changes_requested` の regression test で、`git add -A` / `git commit` / `git push` / `gh pr create` が呼ばれないことを固定した。
+
+### 2026-06-29 review gate follow-up
+
+- 設計判断: `run_agent` は `claude -p --output-format json --no-session-persistence` に加えて、`--permission-mode default` と ADR-004 の sandbox/permission 設定を `--settings` で明示する。machine-local な Claude 設定に安全境界を暗黙依存させないため。
+- 設計判断: `plan.md` / `plan-review.md` / `code-review.md` は Issue / Plan / Diff を untrusted data と明示し、そこに含まれる指示を実行しない境界を追加した。prompt injection による false-green を避ける。
+- 設計判断: CodeReview verdict や PR URL など primary outcome が出た後の観察ログ失敗は、primary outcome を含む error として返す。外部副作用後に URL や verdict がログ I/O error に隠れることを避ける。
+- 設計判断: `Stage::ALL` は実行順として `CodeReview` を `PrCreation` より前に置く。publish gate の実装順と public stage metadata を一致させる。
+- テスト判断: 空 CodeReview diff、dirty main worktree、既存 worktree、変更なし publish、primary outcome 後の log failure、明示 Claude sandbox settings を fake-tool 統合テストで固定する。

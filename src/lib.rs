@@ -1,8 +1,8 @@
-//! code-sherpa pipeline primitives.
+//! code-sherpa pipeline primitives and v0 deterministic manager.
 //!
 //! Drives a GitHub Issue through planning, implementation, testing, and
-//! review stages. This module holds the deterministic primitives the
-//! pipeline manager builds on; stage orchestration is layered on top.
+//! review stages. This module holds the deterministic primitives and the
+//! walking-skeleton stage orchestration built on top of them.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -34,6 +34,7 @@ pub const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 const CAPTURE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAUDE_AGENT_SETTINGS: &str = r#"{"sandbox":{"enabled":true,"allowUnsandboxedCommands":false,"network":{"allowedDomains":["api.anthropic.com","*.anthropic.com","github.com","*.githubusercontent.com","*.npmjs.org","pypi.org","files.pythonhosted.org"]},"filesystem":{"denyRead":["~/.aws/credentials","~/.ssh"]}},"permissions":{"deny":["Bash(rm -rf *)","Bash(chmod 777 *)","Read(./.env)","Read(./.env.*)","Read(**/*.pem)","Read(**/*.key)"]}}"#;
 
 /// A stage in the pipeline, in execution order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +45,8 @@ pub enum Stage {
     BranchCreation,
     Implementation,
     TestExecution,
-    PrCreation,
     CodeReview,
+    PrCreation,
 }
 
 impl Stage {
@@ -57,8 +58,8 @@ impl Stage {
         Stage::BranchCreation,
         Stage::Implementation,
         Stage::TestExecution,
-        Stage::PrCreation,
         Stage::CodeReview,
+        Stage::PrCreation,
     ];
 
     /// The serialization name for this stage.
@@ -70,8 +71,8 @@ impl Stage {
             Stage::BranchCreation => "branch_creation",
             Stage::Implementation => "implementation",
             Stage::TestExecution => "test_execution",
-            Stage::PrCreation => "pr_creation",
             Stage::CodeReview => "code_review",
+            Stage::PrCreation => "pr_creation",
         }
     }
 }
@@ -327,7 +328,7 @@ pub fn run_pipeline(
             Ok(()) => break,
             Err(err) => {
                 ctx.last_error = format!("{err:#}");
-                log_stage(
+                if let Err(log_err) = log_stage(
                     options,
                     StageLog {
                         stage: Stage::TestExecution,
@@ -338,7 +339,12 @@ pub fn run_pipeline(
                         error: Some(&ctx.last_error),
                         verdict: None,
                     },
-                )?;
+                ) {
+                    bail!(
+                        "TestExecution failed: {}; failed to write observation log: {log_err:#}",
+                        ctx.last_error
+                    );
+                }
                 record_retry(
                     options,
                     Stage::TestExecution,
@@ -705,7 +711,10 @@ fn run_pr_creation(ctx: &PipelineContext, options: &PipelineOptions) -> Result<O
         .context("PrCreation git push failed")?;
 
         if let Some(url) = existing_pr {
-            log_pr_creation(options, ctx, &title, &body, false, Some(&url))?;
+            log_pr_creation(options, ctx, &title, &body, false, Some(&url))
+                .with_context(|| {
+                    format!("PrCreation pushed branch for existing PR {url} but failed to write observation log")
+                })?;
             return Ok(Some(url));
         }
 
@@ -735,7 +744,9 @@ fn run_pr_creation(ctx: &PipelineContext, options: &PipelineOptions) -> Result<O
         if url.is_empty() {
             bail!("PrCreation gh pr create returned empty URL");
         }
-        log_pr_creation(options, ctx, &title, &body, false, Some(&url))?;
+        log_pr_creation(options, ctx, &title, &body, false, Some(&url)).with_context(|| {
+            format!("PrCreation created PR {url} but failed to write observation log")
+        })?;
         return Ok(Some(url));
     }
 
@@ -913,7 +924,7 @@ fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
     let raw = run_agent(&prompt, Some(worktree), options.agent_timeout)
         .context("CodeReview agent failed")?;
     let verdict = parse_review_verdict(&raw).context("CodeReview verdict parse failed")?;
-    log_stage(
+    if let Err(log_err) = log_stage(
         options,
         StageLog {
             stage: Stage::CodeReview,
@@ -928,7 +939,12 @@ fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
             error: None,
             verdict: Some((&raw, &verdict)),
         },
-    )?;
+    ) {
+        bail!(
+            "CodeReview produced verdict {}; failed to write observation log: {log_err:#}",
+            verdict.decision.as_str()
+        );
+    }
     Ok(verdict)
 }
 
@@ -1350,7 +1366,16 @@ fn redacted_argv(cmd: &[String]) -> String {
 /// returning the agent's `result` field.
 pub fn run_agent(prompt: &str, cwd: Option<&Path>, timeout: Duration) -> Result<String> {
     let mut command = Command::new("claude");
-    command.args(["-p", "--output-format", "json", "--no-session-persistence"]);
+    command.args([
+        "-p",
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+        "--permission-mode",
+        "default",
+        "--settings",
+        CLAUDE_AGENT_SETTINGS,
+    ]);
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }

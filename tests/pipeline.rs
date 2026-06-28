@@ -26,8 +26,8 @@ fn stage_values_and_order() {
         "branch_creation",
         "implementation",
         "test_execution",
-        "pr_creation",
         "code_review",
+        "pr_creation",
     ];
     let actual: Vec<&str> = Stage::ALL.iter().map(|s| s.as_str()).collect();
     assert_eq!(actual, expected);
@@ -164,9 +164,16 @@ printf '{"result":"agent done"}'
         std::fs::read_to_string(work.path().join("prompt.txt")).unwrap(),
         "please plan"
     );
-    assert_eq!(
-        std::fs::read_to_string(work.path().join("args.txt")).unwrap(),
-        "-p\n--output-format\njson\n--no-session-persistence\n"
+    let args = std::fs::read_to_string(work.path().join("args.txt")).unwrap();
+    assert!(args.contains("-p\n"), "{args}");
+    assert!(args.contains("--output-format\njson\n"), "{args}");
+    assert!(args.contains("--no-session-persistence\n"), "{args}");
+    assert!(args.contains("--permission-mode\ndefault\n"), "{args}");
+    assert!(args.contains("--settings\n"), "{args}");
+    assert!(args.contains("\"sandbox\":{\"enabled\":true"), "{args}");
+    assert!(
+        args.contains("\"allowUnsandboxedCommands\":false"),
+        "{args}"
     );
 }
 
@@ -761,6 +768,169 @@ fn pipeline_publish_mode_does_not_push_before_code_review_approval() {
     assert!(!calls.contains("gh pr create"), "{calls}");
 }
 
+#[cfg(unix)]
+#[test]
+fn pipeline_fails_before_branch_creation_when_main_worktree_is_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::DirtyMain, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("BranchCreation requires a clean working tree"),
+        "{err:#}"
+    );
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(!calls.contains("git worktree add"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_fails_before_branch_creation_when_target_worktree_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(dir.path().join(".sherpa-worktrees")).unwrap();
+    std::fs::create_dir(dir.path().join(".sherpa-worktrees/issue-10")).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::Happy, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("BranchCreation target worktree already exists"),
+        "{err:#}"
+    );
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(!calls.contains("git worktree add"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_fails_when_code_review_collects_empty_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::EmptyCodeReviewDiff, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("CodeReview collected an empty diff"),
+        "{err:#}"
+    );
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(!calls.contains("git add -A"), "{calls}");
+    assert!(!calls.contains("git commit"), "{calls}");
+    assert!(!calls.contains("git push"), "{calls}");
+    assert!(!calls.contains("gh pr create"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_publish_mode_fails_when_no_worktree_changes_remain() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    options.publish = true;
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::NoPublishChanges, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("PrCreation found no worktree changes to publish"),
+        "{err:#}"
+    );
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(!calls.contains("git add -A"), "{calls}");
+    assert!(!calls.contains("git commit"), "{calls}");
+    assert!(!calls.contains("git push"), "{calls}");
+    assert!(!calls.contains("gh pr create"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_preserves_created_pr_url_when_observation_log_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let log_path = dir.path().join("observations.jsonl");
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = log_path;
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    options.publish = true;
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::LogFailsAfterPrCreate, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(
+            "PrCreation created PR https://github.com/owner/repo/pull/8 but failed to write observation log"
+        ),
+        "{message}"
+    );
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(calls.contains("gh pr create"), "{calls}");
+}
+
 #[test]
 fn cli_runs_pipeline_in_dry_run_mode() {
     let dir = tempfile::tempdir().unwrap();
@@ -1003,6 +1173,10 @@ enum FakeScenario {
     MalformedExistingPr,
     MissingIssueBody,
     CodeReviewChanges,
+    DirtyMain,
+    EmptyCodeReviewDiff,
+    LogFailsAfterPrCreate,
+    NoPublishChanges,
 }
 
 #[cfg(unix)]
@@ -1042,6 +1216,10 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  if [ "${SHERPA_SCENARIO:-happy}" = "log_fails_after_pr_create" ]; then
+    rm -f "$SHERPA_LOG_PATH"
+    mkdir "$SHERPA_LOG_PATH"
+  fi
   printf 'https://github.com/owner/repo/pull/8\n'
   exit 0
 fi
@@ -1058,7 +1236,18 @@ fi
 if [ "$1" = "status" ] && [ "$2" = "--porcelain" ]; then
   case "$PWD" in
     */.sherpa-worktrees/*)
-      printf '?? implemented.txt\n'
+      case "${SHERPA_SCENARIO:-happy}" in
+        no_publish_changes)
+          ;;
+        *)
+          printf '?? implemented.txt\n'
+          ;;
+      esac
+      ;;
+    *)
+      if [ "${SHERPA_SCENARIO:-happy}" = "dirty_main" ]; then
+        printf ' M src/lib.rs\n'
+      fi
       ;;
   esac
   exit 0
@@ -1110,6 +1299,9 @@ if [ "$1" = "diff" ]; then
   if [ ! -e "$SHERPA_FAKE_ROOT/intent-to-add" ]; then
     exit 0
   fi
+  if [ "${SHERPA_SCENARIO:-happy}" = "empty_code_review_diff" ]; then
+    exit 0
+  fi
   printf '%s\n' \
     'diff --git a/implemented.txt b/implemented.txt' \
     'new file mode 100644' \
@@ -1128,7 +1320,11 @@ exec /usr/bin/git "$@"
         | FakeScenario::ExistingPr
         | FakeScenario::MalformedExistingPr
         | FakeScenario::MissingIssueBody
-        | FakeScenario::CodeReviewChanges => r#"VERDICT: approve\nplan ok"#,
+        | FakeScenario::CodeReviewChanges
+        | FakeScenario::DirtyMain
+        | FakeScenario::EmptyCodeReviewDiff
+        | FakeScenario::LogFailsAfterPrCreate
+        | FakeScenario::NoPublishChanges => r#"VERDICT: approve\nplan ok"#,
         FakeScenario::RejectPlan => r#"VERDICT: reject\nplan too broad"#,
         FakeScenario::RejectThenApprovePlan => r#"dynamic"#,
     };
@@ -1136,6 +1332,9 @@ exec /usr/bin/git "$@"
         &bin_dir.join("claude"),
         &format!(
             r#"#!/bin/sh
+if [ -n "${{SHERPA_CALL_LOG:-}}" ]; then
+  printf 'claude %s\n' "$*" >> "$SHERPA_CALL_LOG"
+fi
 if [ "$1" = "--version" ]; then
   printf 'claude-test\n'
   exit 0
@@ -1222,6 +1421,7 @@ exit 0
     let old_path = std::env::var_os("PATH");
     let old_call_log = std::env::var_os("SHERPA_CALL_LOG");
     let old_fake_root = std::env::var_os("SHERPA_FAKE_ROOT");
+    let old_log_path = std::env::var_os("SHERPA_LOG_PATH");
     let old_scenario = std::env::var_os("SHERPA_SCENARIO");
     let mut paths = vec![bin_dir];
     if let Some(path) = &old_path {
@@ -1237,6 +1437,10 @@ exit 0
         FakeScenario::MalformedExistingPr => "malformed_existing_pr",
         FakeScenario::MissingIssueBody => "missing_issue_body",
         FakeScenario::CodeReviewChanges => "code_review_changes",
+        FakeScenario::DirtyMain => "dirty_main",
+        FakeScenario::EmptyCodeReviewDiff => "empty_code_review_diff",
+        FakeScenario::LogFailsAfterPrCreate => "log_fails_after_pr_create",
+        FakeScenario::NoPublishChanges => "no_publish_changes",
     };
 
     // SAFETY: tests that mutate PATH are serialized by ENV_LOCK.
@@ -1244,6 +1448,7 @@ exit 0
         std::env::set_var("PATH", new_path);
         std::env::set_var("SHERPA_CALL_LOG", call_log);
         std::env::set_var("SHERPA_FAKE_ROOT", root);
+        std::env::set_var("SHERPA_LOG_PATH", root.join("observations.jsonl"));
         std::env::set_var("SHERPA_SCENARIO", scenario_name);
     }
     let result = f();
@@ -1260,6 +1465,10 @@ exit 0
         match old_fake_root {
             Some(path) => std::env::set_var("SHERPA_FAKE_ROOT", path),
             None => std::env::remove_var("SHERPA_FAKE_ROOT"),
+        }
+        match old_log_path {
+            Some(path) => std::env::set_var("SHERPA_LOG_PATH", path),
+            None => std::env::remove_var("SHERPA_LOG_PATH"),
         }
         match old_scenario {
             Some(value) => std::env::set_var("SHERPA_SCENARIO", value),
