@@ -522,8 +522,7 @@ fn run_plan_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> Re
         ("issue_body", ctx.issue_body.as_str()),
     ]);
     let prompt = load_prompt("plan.md", &options.prompts_dir, &vars)?;
-    ctx.plan = run_agent(&prompt, Some(&options.repo_root), options.agent_timeout)
-        .context("PlanCreation agent failed")?;
+    ctx.plan = run_review_agent(&prompt, options).context("PlanCreation agent failed")?;
     log_stage(
         options,
         StageLog {
@@ -548,8 +547,7 @@ fn run_plan_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
         ("plan", ctx.plan.as_str()),
     ]);
     let prompt = load_prompt("plan-review.md", &options.prompts_dir, &vars)?;
-    let raw = run_agent(&prompt, Some(&options.repo_root), options.agent_timeout)
-        .context("PlanReview agent failed")?;
+    let raw = run_review_agent(&prompt, options).context("PlanReview agent failed")?;
     let verdict = parse_review_verdict(&raw).context("PlanReview verdict parse failed")?;
     log_stage(
         options,
@@ -663,7 +661,7 @@ fn run_implementation(ctx: &mut PipelineContext, options: &PipelineOptions) -> R
 fn run_test_execution(ctx: &mut PipelineContext, options: &PipelineOptions) -> Result<()> {
     let worktree = Path::new(&ctx.worktree_path);
     for cmd in &options.test_commands {
-        run_cmd_owned(cmd, Some(worktree), options.command_timeout)
+        run_isolated_test_cmd(cmd, worktree, options)
             .with_context(|| format!("TestExecution failed: {}", redacted_argv(cmd)))?;
     }
     log_stage(
@@ -921,8 +919,7 @@ fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
         ("diff", diff.as_str()),
     ]);
     let prompt = load_prompt("code-review.md", &options.prompts_dir, &vars)?;
-    let raw = run_agent(&prompt, Some(worktree), options.agent_timeout)
-        .context("CodeReview agent failed")?;
+    let raw = run_review_agent(&prompt, options).context("CodeReview agent failed")?;
     let verdict = parse_review_verdict(&raw).context("CodeReview verdict parse failed")?;
     if let Err(log_err) = log_stage(
         options,
@@ -940,9 +937,11 @@ fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
             verdict: Some((&raw, &verdict)),
         },
     ) {
+        let reasons = review_reasons(&verdict);
         bail!(
-            "CodeReview produced verdict {}; failed to write observation log: {log_err:#}",
-            verdict.decision.as_str()
+            "CodeReview produced verdict {}: {}; failed to write observation log: {log_err:#}",
+            verdict.decision.as_str(),
+            reasons
         );
     }
     Ok(verdict)
@@ -1348,6 +1347,201 @@ fn run_cmd_owned(cmd: &[String], cwd: Option<&Path>, timeout: Duration) -> Resul
     run_cmd(&refs, cwd, timeout)
 }
 
+fn run_isolated_test_cmd(cmd: &[String], worktree: &Path, options: &PipelineOptions) -> Result<()> {
+    if cmd.is_empty() {
+        bail!("TestExecution command must not be empty");
+    }
+
+    let sandbox_cmd = sandboxed_test_command(cmd, worktree, options)?;
+    let label = sandbox_cmd
+        .first()
+        .map(String::as_str)
+        .unwrap_or("test sandbox");
+    run_cmd_owned_with_env(
+        &sandbox_cmd,
+        Some(worktree),
+        options.command_timeout,
+        sandbox_env(worktree)?,
+        label,
+    )?;
+    Ok(())
+}
+
+fn sandboxed_test_command(
+    cmd: &[String],
+    worktree: &Path,
+    options: &PipelineOptions,
+) -> Result<Vec<String>> {
+    if cfg!(target_os = "macos") {
+        let mut sandbox_cmd = vec![
+            "sandbox-exec".to_owned(),
+            "-p".to_owned(),
+            test_sandbox_profile(worktree, options),
+            "--".to_owned(),
+        ];
+        sandbox_cmd.extend(cmd.iter().cloned());
+        return Ok(sandbox_cmd);
+    }
+    if cfg!(target_os = "linux") {
+        return Ok(linux_sandboxed_test_command(cmd, worktree));
+    }
+    bail!(
+        "TestExecution requires a supported sandbox backend; macOS sandbox-exec and Linux bwrap are currently supported"
+    );
+}
+
+fn sandbox_env(worktree: &Path) -> Result<Vec<(String, String)>> {
+    let home = worktree.join(".sherpa-sandbox-home");
+    let tmp = home.join("tmp");
+    std::fs::create_dir_all(&tmp)
+        .with_context(|| format!("cannot create sandbox home {}", home.display()))?;
+
+    let mut envs = vec![
+        ("HOME".to_owned(), home.display().to_string()),
+        ("TMPDIR".to_owned(), tmp.display().to_string()),
+        (
+            "CARGO_TARGET_DIR".to_owned(),
+            worktree.join("target").display().to_string(),
+        ),
+        ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
+    ];
+    for key in [
+        "PATH",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "SHERPA_CALL_LOG",
+        "SHERPA_FAKE_ROOT",
+        "SHERPA_LOG_PATH",
+        "SHERPA_SCENARIO",
+    ] {
+        if let Some(value) = std::env::var_os(key).and_then(|value| value.into_string().ok()) {
+            envs.push((key.to_owned(), value));
+        }
+    }
+    if !envs.iter().any(|(key, _)| key == "CARGO_HOME")
+        && let Some(home_dir) = std::env::var_os("HOME").and_then(|value| value.into_string().ok())
+    {
+        envs.push(("CARGO_HOME".to_owned(), format!("{home_dir}/.cargo")));
+    }
+    if !envs.iter().any(|(key, _)| key == "RUSTUP_HOME")
+        && let Some(home_dir) = std::env::var_os("HOME").and_then(|value| value.into_string().ok())
+    {
+        envs.push(("RUSTUP_HOME".to_owned(), format!("{home_dir}/.rustup")));
+    }
+    Ok(envs)
+}
+
+fn run_cmd_owned_with_env(
+    cmd: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    envs: Vec<(String, String)>,
+    label: &str,
+) -> Result<String> {
+    let Some((program, args)) = cmd.split_first() else {
+        bail!("{label}: empty command");
+    };
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command.env_clear();
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    capture(command, None, timeout, label)
+}
+
+fn test_sandbox_profile(worktree: &Path, _options: &PipelineOptions) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut read_subpaths = vec![
+        "/bin".to_owned(),
+        "/dev".to_owned(),
+        "/Library".to_owned(),
+        "/System".to_owned(),
+        "/usr".to_owned(),
+        "/private/tmp".to_owned(),
+        "/private/var/folders".to_owned(),
+        worktree.display().to_string(),
+    ];
+    if !home.is_empty() {
+        read_subpaths.push(format!("{home}/.cargo/bin"));
+        read_subpaths.push(format!("{home}/.cargo/git"));
+        read_subpaths.push(format!("{home}/.cargo/registry"));
+        read_subpaths.push(format!("{home}/.rustup/toolchains"));
+    }
+
+    let read_rules = read_subpaths
+        .iter()
+        .map(|path| format!("  (subpath \"{}\")", sandbox_escape(path)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let worktree = sandbox_escape(&worktree.display().to_string());
+    format!(
+        r#"(version 1)
+(deny default)
+(allow process*)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow file-read-metadata)
+(allow file-read*
+{read_rules})
+(allow file-write*
+  (subpath "{worktree}"))
+(deny network*)
+"#
+    )
+}
+
+fn linux_sandboxed_test_command(cmd: &[String], worktree: &Path) -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut sandbox_cmd = vec![
+        "bwrap".to_owned(),
+        "--die-with-parent".to_owned(),
+        "--unshare-all".to_owned(),
+        "--unshare-net".to_owned(),
+        "--new-session".to_owned(),
+        "--dev".to_owned(),
+        "/dev".to_owned(),
+        "--proc".to_owned(),
+        "/proc".to_owned(),
+        "--tmpfs".to_owned(),
+        "/tmp".to_owned(),
+    ];
+    let home = home.strip_suffix('/').unwrap_or(&home);
+    for path in [
+        "/bin".to_owned(),
+        "/etc".to_owned(),
+        "/lib".to_owned(),
+        "/lib64".to_owned(),
+        "/nix".to_owned(),
+        "/opt".to_owned(),
+        "/usr".to_owned(),
+        home.to_owned() + "/.cargo/bin",
+        home.to_owned() + "/.cargo/git",
+        home.to_owned() + "/.cargo/registry",
+        home.to_owned() + "/.rustup/toolchains",
+    ] {
+        sandbox_cmd.extend(["--ro-bind-try".to_owned(), path.clone(), path]);
+    }
+    let worktree = worktree.display().to_string();
+    sandbox_cmd.extend([
+        "--bind".to_owned(),
+        worktree.clone(),
+        worktree.clone(),
+        "--chdir".to_owned(),
+        worktree,
+        "--".to_owned(),
+    ]);
+    sandbox_cmd.extend(cmd.iter().cloned());
+    sandbox_cmd
+}
+
+fn sandbox_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn redacted_argv(cmd: &[String]) -> String {
     cmd.iter()
         .map(|part| {
@@ -1362,10 +1556,44 @@ fn redacted_argv(cmd: &[String]) -> String {
         .join(" ")
 }
 
+fn review_reasons(verdict: &ReviewVerdict) -> String {
+    if verdict.reasons.is_empty() {
+        "no reasons provided".to_owned()
+    } else {
+        verdict.reasons.join("; ")
+    }
+}
+
 /// Invoke the Claude Code agent headlessly, feeding `prompt` on stdin and
 /// returning the agent's `result` field.
 pub fn run_agent(prompt: &str, cwd: Option<&Path>, timeout: Duration) -> Result<String> {
     let mut command = Command::new("claude");
+    add_claude_base_args(&mut command);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let stdout = capture(command, Some(prompt), timeout, "claude")?;
+    parse_agent_output(&stdout)
+}
+
+fn run_review_agent(prompt: &str, options: &PipelineOptions) -> Result<String> {
+    let mut command = Command::new("claude");
+    add_claude_base_args(&mut command);
+    command.args([
+        "--safe-mode",
+        "--setting-sources",
+        "user",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--tools",
+        "",
+    ]);
+    command.current_dir(&options.repo_root);
+    let stdout = capture(command, Some(prompt), options.agent_timeout, "claude")?;
+    parse_agent_output(&stdout)
+}
+
+fn add_claude_base_args(command: &mut Command) {
     command.args([
         "-p",
         "--output-format",
@@ -1376,11 +1604,6 @@ pub fn run_agent(prompt: &str, cwd: Option<&Path>, timeout: Duration) -> Result<
         "--settings",
         CLAUDE_AGENT_SETTINGS,
     ]);
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    let stdout = capture(command, Some(prompt), timeout, "claude")?;
-    parse_agent_output(&stdout)
 }
 
 /// Parse the JSON envelope emitted by `claude -p --output-format json` and

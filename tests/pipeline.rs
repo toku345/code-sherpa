@@ -454,6 +454,32 @@ fn pipeline_happy_path_with_fake_tools_dry_runs_pr_and_reviews_code() {
         review_prompt.contains("diff --git a/implemented.txt b/implemented.txt"),
         "{review_prompt}"
     );
+    let implement_prompt =
+        std::fs::read_to_string(dir.path().join("implement-prompt-1.txt")).unwrap();
+    assert!(
+        implement_prompt.contains("Security boundary:"),
+        "{implement_prompt}"
+    );
+    assert!(implement_prompt.contains("<plan>"), "{implement_prompt}");
+    assert!(
+        implement_prompt.contains("<previous_error>"),
+        "{implement_prompt}"
+    );
+    let review_cwd = std::fs::read_to_string(dir.path().join("code-review-cwd.txt")).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(review_cwd.trim()).unwrap(),
+        std::fs::canonicalize(&repo).unwrap()
+    );
+    assert!(
+        calls.contains("sandbox-exec -p ") || calls.contains("bwrap --die-with-parent "),
+        "{calls}"
+    );
+    assert!(calls.contains("claude -p --output-format json --no-session-persistence --permission-mode default --settings "), "{calls}");
+    assert!(calls.contains("--safe-mode"), "{calls}");
+    assert!(calls.contains("--setting-sources user"), "{calls}");
+    assert!(calls.contains("--strict-mcp-config"), "{calls}");
+    assert!(calls.contains("--disable-slash-commands"), "{calls}");
+    assert!(calls.contains("--tools "), "{calls}");
 }
 
 #[cfg(unix)]
@@ -732,6 +758,38 @@ fn pipeline_fails_after_code_review_changes_requested() {
     );
     let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
     assert!(!calls.contains("gh pr create"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_preserves_code_review_reasons_when_observation_log_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::CodeReviewChangesLogFails, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("CodeReview produced verdict changes_requested: fix code"),
+        "{message}"
+    );
+    assert!(
+        message.contains("failed to write observation log"),
+        "{message}"
+    );
 }
 
 #[cfg(unix)]
@@ -1173,6 +1231,7 @@ enum FakeScenario {
     MalformedExistingPr,
     MissingIssueBody,
     CodeReviewChanges,
+    CodeReviewChangesLogFails,
     DirtyMain,
     EmptyCodeReviewDiff,
     LogFailsAfterPrCreate,
@@ -1315,12 +1374,47 @@ fi
 exec /usr/bin/git "$@"
 "#,
     );
+    write_executable(
+        &bin_dir.join("sandbox-exec"),
+        r#"#!/bin/sh
+if [ -n "${SHERPA_CALL_LOG:-}" ]; then
+  printf 'sandbox-exec %s\n' "$*" >> "$SHERPA_CALL_LOG"
+fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    exec "$@"
+  fi
+  shift
+done
+printf 'sandbox-exec missing command separator\n' >&2
+exit 1
+"#,
+    );
+    write_executable(
+        &bin_dir.join("bwrap"),
+        r#"#!/bin/sh
+if [ -n "${SHERPA_CALL_LOG:-}" ]; then
+  printf 'bwrap %s\n' "$*" >> "$SHERPA_CALL_LOG"
+fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    exec "$@"
+  fi
+  shift
+done
+printf 'bwrap missing command separator\n' >&2
+exit 1
+"#,
+    );
     let plan_review = match scenario {
         FakeScenario::Happy
         | FakeScenario::ExistingPr
         | FakeScenario::MalformedExistingPr
         | FakeScenario::MissingIssueBody
         | FakeScenario::CodeReviewChanges
+        | FakeScenario::CodeReviewChangesLogFails
         | FakeScenario::DirtyMain
         | FakeScenario::EmptyCodeReviewDiff
         | FakeScenario::LogFailsAfterPrCreate
@@ -1370,7 +1464,12 @@ case "$prompt" in
     ;;
   *"code review agent"*)
     printf '%s' "$prompt" > "$SHERPA_FAKE_ROOT/code-review-prompt.txt"
-    if [ "${{SHERPA_SCENARIO:-happy}}" = "code_review_changes" ]; then
+    pwd > "$SHERPA_FAKE_ROOT/code-review-cwd.txt"
+    if [ "${{SHERPA_SCENARIO:-happy}}" = "code_review_changes_log_fails" ]; then
+      rm -f "$SHERPA_LOG_PATH"
+      mkdir "$SHERPA_LOG_PATH"
+      printf '%s' '{{"result":"VERDICT: changes_requested\nfix code"}}'
+    elif [ "${{SHERPA_SCENARIO:-happy}}" = "code_review_changes" ]; then
       printf '%s' '{{"result":"VERDICT: changes_requested\nfix code"}}'
     else
       printf '%s' '{{"result":"VERDICT: approve\ncode ok"}}'
@@ -1437,6 +1536,7 @@ exit 0
         FakeScenario::MalformedExistingPr => "malformed_existing_pr",
         FakeScenario::MissingIssueBody => "missing_issue_body",
         FakeScenario::CodeReviewChanges => "code_review_changes",
+        FakeScenario::CodeReviewChangesLogFails => "code_review_changes_log_fails",
         FakeScenario::DirtyMain => "dirty_main",
         FakeScenario::EmptyCodeReviewDiff => "empty_code_review_diff",
         FakeScenario::LogFailsAfterPrCreate => "log_fails_after_pr_create",

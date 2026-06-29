@@ -153,3 +153,7 @@ push + `gh pr create` は最初の不可逆な外部操作（CLAUDE.md outward-f
 - 設計判断: CodeReview verdict や PR URL など primary outcome が出た後の観察ログ失敗は、primary outcome を含む error として返す。外部副作用後に URL や verdict がログ I/O error に隠れることを避ける。
 - 設計判断: `Stage::ALL` は実行順として `CodeReview` を `PrCreation` より前に置く。publish gate の実装順と public stage metadata を一致させる。
 - テスト判断: 空 CodeReview diff、dirty main worktree、既存 worktree、変更なし publish、primary outcome 後の log failure、明示 Claude sandbox settings を fake-tool 統合テストで固定する。
+- 設計判断: TestExecution は macOS では `sandbox-exec`、Linux では `bwrap` を必須 backend とし、scrubbed env / isolated HOME / network deny / worktree-only write で実行する。生成コードを host 権限で直接 `cargo test` / `cargo clippy` しないため。非対応 OS や backend 不在では fail loud とする。
+- 設計判断: PlanCreation / PlanReview / CodeReview は trusted repo cwd から `--safe-mode --setting-sources user --strict-mcp-config --disable-slash-commands --tools ""` で起動する。candidate worktree の `CLAUDE.md` / `.claude` / hooks / MCP / plugins が publish gate の review agent に影響しないようにするため。`--bare` は OAuth/keychain 認証を無効化して Max/Claude Code 運用を壊し得るため、default では使わない。Implementation は編集対象 worktree で実行する。
+- 設計判断: `implement.md` も Plan / Previous error を untrusted data として囲む。`ctx.plan` と `ctx.last_error` は issue 由来 agent output や test failure output を含み得るため。
+- 設計判断: CodeReview の log write failure では decision だけでなく reasons も error に含める。non-approve review の修正理由をログ I/O エラーで失わないため。
