@@ -763,6 +763,43 @@ fn pipeline_publish_mode_fails_if_reviewed_diff_changes_before_commit() {
 
 #[cfg(unix)]
 #[test]
+fn pipeline_publish_mode_fails_if_staged_diff_changes_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    options.publish = true;
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(
+        dir.path(),
+        FakeScenario::StagedDiffDriftsBeforeCommit,
+        || run_pipeline(ctx, &options),
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("PrCreation staged diff changed after CodeReview approval"),
+        "{err:#}"
+    );
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(calls.contains("git add -A"), "{calls}");
+    assert!(calls.contains("git diff --cached --no-ext-diff"), "{calls}");
+    assert!(!calls.contains("git commit"), "{calls}");
+    assert!(!calls.contains("git push"), "{calls}");
+    assert!(!calls.contains("gh pr create"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
 fn pipeline_fails_loud_when_issue_body_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
@@ -1320,6 +1357,7 @@ enum FakeScenario {
     CodeReviewChanges,
     CodeReviewChangesLogFails,
     CodeReviewDiffDriftsBeforePublish,
+    StagedDiffDriftsBeforeCommit,
     DirtyMain,
     EmptyCodeReviewDiff,
     LogFailsAfterPrCreate,
@@ -1439,6 +1477,11 @@ if [ "$1" = "push" ]; then
   exit 0
 fi
 if [ "$1" = "diff" ]; then
+  cached=false
+  if [ "$2" = "--cached" ]; then
+    cached=true
+    shift
+  fi
   if [ "$2" != "--no-ext-diff" ] || [ "$3" != "0123456789abcdef0123456789abcdef01234567" ]; then
     printf 'unexpected diff args: %s\n' "$*" >&2
     exit 1
@@ -1459,6 +1502,18 @@ if [ "$1" = "diff" ]; then
       '@@ -0,0 +1,2 @@' \
       '+implemented' \
       '+drifted'
+    exit 0
+  fi
+  if [ "${SHERPA_SCENARIO:-happy}" = "staged_diff_drifts_before_commit" ] && [ "$cached" = "true" ]; then
+    printf '%s\n' \
+      'diff --git a/implemented.txt b/implemented.txt' \
+      'new file mode 100644' \
+      'index 0000000..8ab686e' \
+      '--- /dev/null' \
+      '+++ b/implemented.txt' \
+      '@@ -0,0 +1,2 @@' \
+      '+implemented' \
+      '+staged drift'
     exit 0
   fi
   printf '%s\n' \
@@ -1518,6 +1573,7 @@ exit 1
         | FakeScenario::CodeReviewChanges
         | FakeScenario::CodeReviewChangesLogFails
         | FakeScenario::CodeReviewDiffDriftsBeforePublish
+        | FakeScenario::StagedDiffDriftsBeforeCommit
         | FakeScenario::DirtyMain
         | FakeScenario::EmptyCodeReviewDiff
         | FakeScenario::LogFailsAfterPrCreate
@@ -1644,6 +1700,7 @@ exit 0
         FakeScenario::CodeReviewChanges => "code_review_changes",
         FakeScenario::CodeReviewChangesLogFails => "code_review_changes_log_fails",
         FakeScenario::CodeReviewDiffDriftsBeforePublish => "code_review_diff_drifts_before_publish",
+        FakeScenario::StagedDiffDriftsBeforeCommit => "staged_diff_drifts_before_commit",
         FakeScenario::DirtyMain => "dirty_main",
         FakeScenario::EmptyCodeReviewDiff => "empty_code_review_diff",
         FakeScenario::LogFailsAfterPrCreate => "log_fails_after_pr_create",
