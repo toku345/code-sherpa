@@ -157,3 +157,8 @@ push + `gh pr create` は最初の不可逆な外部操作（CLAUDE.md outward-f
 - 設計判断: PlanCreation / PlanReview / CodeReview は trusted repo cwd から `--safe-mode --setting-sources user --strict-mcp-config --disable-slash-commands --tools ""` で起動する。candidate worktree の `CLAUDE.md` / `.claude` / hooks / MCP / plugins が publish gate の review agent に影響しないようにするため。`--bare` は OAuth/keychain 認証を無効化して Max/Claude Code 運用を壊し得るため、default では使わない。Implementation は編集対象 worktree で実行する。
 - 設計判断: `implement.md` も Plan / Previous error を untrusted data として囲む。`ctx.plan` と `ctx.last_error` は issue 由来 agent output や test failure output を含み得るため。
 - 設計判断: CodeReview の log write failure では decision だけでなく reasons も error に含める。non-approve review の修正理由をログ I/O エラーで失わないため。
+- 設計判断: CodeReview approval 後の publish では、reviewed diff と commit 直前の diff を再照合して一致しない場合は fail closed とする。review agent が見ていない worktree state を `git add -A` で publish しないため。
+- 設計判断: `publish=true` では `base_ref` が safe な `origin/<branch>` であることを pipeline 開始時に検証する。commit/push 後に PR base validation で失敗する副作用順を避けるため。
+- 設計判断: Claude transcript JSON は `result` event が exactly one の場合だけ受け入れる。複数 result event は wrapper/transcript ambiguity として fail closed する。
+- 設計判断: retry exhaustion error には最後の PlanReview reason / TestExecution error を含める。最終 CLI error だけで次の修正対象が分かるようにするため。
+- 設計判断: observation log の `duration_ms` は `log_stage` 内部ではなく各 stage の開始時刻から測る。ログ書き込み処理時間ではなく stage 実行時間を表すため。

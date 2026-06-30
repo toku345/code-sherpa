@@ -246,6 +246,20 @@ fn parse_agent_output_rejects_transcript_without_result_event() {
 }
 
 #[test]
+fn parse_agent_output_rejects_transcript_with_multiple_result_events() {
+    let err = parse_agent_output(
+        r#"[{"type":"result","result":"first"},{"type":"result","result":"second"}]"#,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("expected exactly one result event, got 2"),
+        "{err}"
+    );
+}
+
+#[test]
 fn parse_agent_output_rejects_transcript_result_event_without_result() {
     let err = parse_agent_output(r#"[{"type":"result","usage":{}}]"#).unwrap_err();
 
@@ -474,6 +488,10 @@ fn pipeline_happy_path_with_fake_tools_dry_runs_pr_and_reviews_code() {
         calls.contains("sandbox-exec -p ") || calls.contains("bwrap --die-with-parent "),
         "{calls}"
     );
+    assert!(calls.contains("sandbox-env HOME="), "{calls}");
+    assert!(calls.contains("/.sherpa-sandbox-home"), "{calls}");
+    assert!(calls.contains("CARGO_NET_OFFLINE=true"), "{calls}");
+    assert!(calls.contains("CARGO_TARGET_DIR="), "{calls}");
     assert!(calls.contains("claude -p --output-format json --no-session-persistence --permission-mode default --settings "), "{calls}");
     assert!(calls.contains("--safe-mode"), "{calls}");
     assert!(calls.contains("--setting-sources user"), "{calls}");
@@ -504,8 +522,9 @@ fn pipeline_escalates_after_plan_review_reject_retries() {
     .unwrap_err();
 
     assert!(
-        err.to_string()
-            .contains("pipeline escalated after 3 attempts on plan_review->plan_creation"),
+        format!("{err:#}").contains(
+            "pipeline escalated after 3 attempts on plan_review->plan_creation: plan too broad"
+        ),
         "{err:#}"
     );
 }
@@ -562,10 +581,11 @@ fn pipeline_escalates_after_test_fail_retries() {
     .unwrap_err();
 
     assert!(
-        err.to_string()
-            .contains("pipeline escalated after 3 attempts on test_execution->implementation"),
+        format!("{err:#}")
+            .contains("pipeline escalated after 3 attempts on test_execution->implementation:"),
         "{err:#}"
     );
+    assert!(format!("{err:#}").contains("gate failed"), "{err:#}");
 }
 
 #[cfg(unix)]
@@ -672,6 +692,73 @@ fn pipeline_publish_mode_creates_pr_when_none_exists() {
     );
     assert!(calls.contains("gh pr create"), "{calls}");
     assert!(calls.contains("--base main"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_rejects_non_origin_publish_base_before_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    options.publish = true;
+    options.base_ref = "0123456789abcdef0123456789abcdef01234567".into();
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(dir.path(), FakeScenario::Happy, || {
+        run_pipeline(ctx, &options)
+    })
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("PipelineOptions base_ref must be an origin/<branch> ref for PR creation"),
+        "{err:#}"
+    );
+    assert!(!dir.path().join("calls.log").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_publish_mode_fails_if_reviewed_diff_changes_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut options = PipelineOptions::new(
+        &repo,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/prompts"),
+    );
+    options.log_path = dir.path().join("observations.jsonl");
+    options.test_commands = vec![vec!["gate-ok".into()]];
+    options.command_timeout = Duration::from_secs(10);
+    options.agent_timeout = Duration::from_secs(10);
+    options.publish = true;
+    let ctx = PipelineContext::new(10, "owner/repo", repo.display().to_string());
+
+    let err = with_fake_pipeline_tools(
+        dir.path(),
+        FakeScenario::CodeReviewDiffDriftsBeforePublish,
+        || run_pipeline(ctx, &options),
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("PrCreation worktree diff changed after CodeReview approval"),
+        "{err:#}"
+    );
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(!calls.contains("git add -A"), "{calls}");
+    assert!(!calls.contains("git commit"), "{calls}");
+    assert!(!calls.contains("git push"), "{calls}");
+    assert!(!calls.contains("gh pr create"), "{calls}");
 }
 
 #[cfg(unix)]
@@ -1232,6 +1319,7 @@ enum FakeScenario {
     MissingIssueBody,
     CodeReviewChanges,
     CodeReviewChangesLogFails,
+    CodeReviewDiffDriftsBeforePublish,
     DirtyMain,
     EmptyCodeReviewDiff,
     LogFailsAfterPrCreate,
@@ -1361,6 +1449,18 @@ if [ "$1" = "diff" ]; then
   if [ "${SHERPA_SCENARIO:-happy}" = "empty_code_review_diff" ]; then
     exit 0
   fi
+  if [ "${SHERPA_SCENARIO:-happy}" = "code_review_diff_drifts_before_publish" ] && [ -e "$SHERPA_FAKE_ROOT/drift-after-review" ]; then
+    printf '%s\n' \
+      'diff --git a/implemented.txt b/implemented.txt' \
+      'new file mode 100644' \
+      'index 0000000..8ab686e' \
+      '--- /dev/null' \
+      '+++ b/implemented.txt' \
+      '@@ -0,0 +1,2 @@' \
+      '+implemented' \
+      '+drifted'
+    exit 0
+  fi
   printf '%s\n' \
     'diff --git a/implemented.txt b/implemented.txt' \
     'new file mode 100644' \
@@ -1379,6 +1479,7 @@ exec /usr/bin/git "$@"
         r#"#!/bin/sh
 if [ -n "${SHERPA_CALL_LOG:-}" ]; then
   printf 'sandbox-exec %s\n' "$*" >> "$SHERPA_CALL_LOG"
+  printf 'sandbox-env HOME=%s TMPDIR=%s CARGO_TARGET_DIR=%s CARGO_NET_OFFLINE=%s\n' "${HOME:-}" "${TMPDIR:-}" "${CARGO_TARGET_DIR:-}" "${CARGO_NET_OFFLINE:-}" >> "$SHERPA_CALL_LOG"
 fi
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--" ]; then
@@ -1396,6 +1497,7 @@ exit 1
         r#"#!/bin/sh
 if [ -n "${SHERPA_CALL_LOG:-}" ]; then
   printf 'bwrap %s\n' "$*" >> "$SHERPA_CALL_LOG"
+  printf 'sandbox-env HOME=%s TMPDIR=%s CARGO_TARGET_DIR=%s CARGO_NET_OFFLINE=%s\n' "${HOME:-}" "${TMPDIR:-}" "${CARGO_TARGET_DIR:-}" "${CARGO_NET_OFFLINE:-}" >> "$SHERPA_CALL_LOG"
 fi
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--" ]; then
@@ -1415,6 +1517,7 @@ exit 1
         | FakeScenario::MissingIssueBody
         | FakeScenario::CodeReviewChanges
         | FakeScenario::CodeReviewChangesLogFails
+        | FakeScenario::CodeReviewDiffDriftsBeforePublish
         | FakeScenario::DirtyMain
         | FakeScenario::EmptyCodeReviewDiff
         | FakeScenario::LogFailsAfterPrCreate
@@ -1469,6 +1572,9 @@ case "$prompt" in
       rm -f "$SHERPA_LOG_PATH"
       mkdir "$SHERPA_LOG_PATH"
       printf '%s' '{{"result":"VERDICT: changes_requested\nfix code"}}'
+    elif [ "${{SHERPA_SCENARIO:-happy}}" = "code_review_diff_drifts_before_publish" ]; then
+      touch "$SHERPA_FAKE_ROOT/drift-after-review"
+      printf '%s' '{{"result":"VERDICT: approve\ncode ok"}}'
     elif [ "${{SHERPA_SCENARIO:-happy}}" = "code_review_changes" ]; then
       printf '%s' '{{"result":"VERDICT: changes_requested\nfix code"}}'
     else
@@ -1537,6 +1643,7 @@ exit 0
         FakeScenario::MissingIssueBody => "missing_issue_body",
         FakeScenario::CodeReviewChanges => "code_review_changes",
         FakeScenario::CodeReviewChangesLogFails => "code_review_changes_log_fails",
+        FakeScenario::CodeReviewDiffDriftsBeforePublish => "code_review_diff_drifts_before_publish",
         FakeScenario::DirtyMain => "dirty_main",
         FakeScenario::EmptyCodeReviewDiff => "empty_code_review_diff",
         FakeScenario::LogFailsAfterPrCreate => "log_fails_after_pr_create",

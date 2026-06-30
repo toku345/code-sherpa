@@ -227,6 +227,12 @@ struct StageLog<'a> {
     output_summary: Option<serde_json::Value>,
     error: Option<&'a str>,
     verdict: Option<(&'a str, &'a ReviewVerdict)>,
+    duration_ms: u128,
+}
+
+struct CodeReviewResult {
+    verdict: ReviewVerdict,
+    reviewed_diff: String,
 }
 
 /// Parse a review verdict from either a JSON object or exactly one leading
@@ -318,12 +324,14 @@ pub fn run_pipeline(
             Stage::PlanReview,
             "plan_review->plan_creation",
             &mut retries,
+            Some(&review_reasons(&verdict)),
         )?;
     }
 
     run_branch_creation(&mut ctx, options)?;
     loop {
         run_implementation(&mut ctx, options)?;
+        let test_started = Instant::now();
         match run_test_execution(&mut ctx, options) {
             Ok(()) => break,
             Err(err) => {
@@ -338,6 +346,7 @@ pub fn run_pipeline(
                         output_summary: None,
                         error: Some(&ctx.last_error),
                         verdict: None,
+                        duration_ms: test_started.elapsed().as_millis(),
                     },
                 ) {
                     bail!(
@@ -350,28 +359,25 @@ pub fn run_pipeline(
                     Stage::TestExecution,
                     "test_execution->implementation",
                     &mut retries,
+                    Some(&ctx.last_error),
                 )?;
             }
         }
     }
 
     let review = run_code_review(&ctx, options)?;
-    if review.decision != ReviewDecision::Approve {
-        let reasons = if review.reasons.is_empty() {
-            "no reasons provided".to_owned()
-        } else {
-            review.reasons.join("; ")
-        };
+    if review.verdict.decision != ReviewDecision::Approve {
+        let reasons = review_reasons(&review.verdict);
         bail!(
             "CodeReview did not approve: {}: {}",
-            review.decision.as_str(),
+            review.verdict.decision.as_str(),
             reasons
         );
     }
-    let pr_url = run_pr_creation(&ctx, options)?;
+    let pr_url = run_pr_creation(&ctx, options, &review.reviewed_diff)?;
     Ok(PipelineOutcome {
         context: ctx,
-        code_review: Some(review),
+        code_review: Some(review.verdict),
         pr_url,
         dry_run: !options.publish,
     })
@@ -387,6 +393,9 @@ fn validate_options(options: &PipelineOptions) -> Result<()> {
     if options.test_commands.iter().any(Vec::is_empty) {
         bail!("PipelineOptions test_commands must not contain empty commands");
     }
+    if options.publish {
+        pr_base_branch(options)?;
+    }
     Ok(())
 }
 
@@ -395,7 +404,9 @@ fn record_retry(
     stage: Stage,
     edge: &'static str,
     retries: &mut HashMap<&'static str, u8>,
+    detail: Option<&str>,
 ) -> Result<()> {
+    let started = Instant::now();
     let attempt = retries.entry(edge).or_default();
     *attempt += 1;
     log_stage(
@@ -406,18 +417,21 @@ fn record_retry(
             outcome: StageOutcome::Partial,
             input_summary: "retry edge",
             output_summary: Some(json!({ "edge": edge, "attempt": *attempt })),
-            error: None,
+            error: detail,
             verdict: None,
+            duration_ms: started.elapsed().as_millis(),
         },
     )?;
     if *attempt >= options.max_retries {
+        if let Some(detail) = detail {
+            bail!("pipeline escalated after {attempt} attempts on {edge}: {detail}");
+        }
         bail!("pipeline escalated after {attempt} attempts on {edge}");
     }
     Ok(())
 }
 
 fn log_stage(options: &PipelineOptions, log: StageLog<'_>) -> Result<()> {
-    let started = Instant::now();
     let mut entry = json!({
         "timestamp": observation_timestamp(),
         "stage": log.stage.as_str(),
@@ -426,7 +440,7 @@ fn log_stage(options: &PipelineOptions, log: StageLog<'_>) -> Result<()> {
         "output": log.output_summary.unwrap_or(serde_json::Value::Null),
         "outcome": log.outcome.as_str(),
         "error": log.error,
-        "duration_ms": started.elapsed().as_millis(),
+        "duration_ms": log.duration_ms,
         "argv": null,
         "artifact": null,
         "retry_edge": null
@@ -467,6 +481,7 @@ fn observation_timestamp() -> String {
 }
 
 fn run_issue_fetch(ctx: &mut PipelineContext, options: &PipelineOptions) -> Result<()> {
+    let started = Instant::now();
     let issue_number = ctx.issue_number.to_string();
     let output = run_cmd(
         &[
@@ -509,12 +524,14 @@ fn run_issue_fetch(ctx: &mut PipelineContext, options: &PipelineOptions) -> Resu
             })),
             error: None,
             verdict: None,
+            duration_ms: started.elapsed().as_millis(),
         },
     )?;
     Ok(())
 }
 
 fn run_plan_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> Result<()> {
+    let started = Instant::now();
     let issue_number = ctx.issue_number.to_string();
     let vars = HashMap::from([
         ("issue_number", issue_number.as_str()),
@@ -533,12 +550,14 @@ fn run_plan_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> Re
             output_summary: Some(json!({ "plan_len": ctx.plan.len() })),
             error: None,
             verdict: None,
+            duration_ms: started.elapsed().as_millis(),
         },
     )?;
     Ok(())
 }
 
 fn run_plan_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<ReviewVerdict> {
+    let started = Instant::now();
     let issue_number = ctx.issue_number.to_string();
     let vars = HashMap::from([
         ("issue_number", issue_number.as_str()),
@@ -559,12 +578,14 @@ fn run_plan_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
             output_summary: Some(json!({ "decision": verdict.decision.as_str() })),
             error: None,
             verdict: Some((&raw, &verdict)),
+            duration_ms: started.elapsed().as_millis(),
         },
     )?;
     Ok(verdict)
 }
 
 fn run_branch_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> Result<()> {
+    let started = Instant::now();
     let status = run_cmd(
         &["git", "status", "--porcelain"],
         Some(&options.repo_root),
@@ -628,12 +649,14 @@ fn run_branch_creation(ctx: &mut PipelineContext, options: &PipelineOptions) -> 
             })),
             error: None,
             verdict: None,
+            duration_ms: started.elapsed().as_millis(),
         },
     )?;
     Ok(())
 }
 
 fn run_implementation(ctx: &mut PipelineContext, options: &PipelineOptions) -> Result<()> {
+    let started = Instant::now();
     let worktree = Path::new(&ctx.worktree_path);
     verify_agent_runtime(worktree, options)?;
     let vars = HashMap::from([
@@ -653,12 +676,14 @@ fn run_implementation(ctx: &mut PipelineContext, options: &PipelineOptions) -> R
             output_summary: Some(json!({ "result_len": result.len() })),
             error: None,
             verdict: None,
+            duration_ms: started.elapsed().as_millis(),
         },
     )?;
     Ok(())
 }
 
 fn run_test_execution(ctx: &mut PipelineContext, options: &PipelineOptions) -> Result<()> {
+    let started = Instant::now();
     let worktree = Path::new(&ctx.worktree_path);
     for cmd in &options.test_commands {
         run_isolated_test_cmd(cmd, worktree, options)
@@ -680,17 +705,27 @@ fn run_test_execution(ctx: &mut PipelineContext, options: &PipelineOptions) -> R
             })),
             error: None,
             verdict: None,
+            duration_ms: started.elapsed().as_millis(),
         },
     )?;
     Ok(())
 }
 
-fn run_pr_creation(ctx: &PipelineContext, options: &PipelineOptions) -> Result<Option<String>> {
+fn run_pr_creation(
+    ctx: &PipelineContext,
+    options: &PipelineOptions,
+    reviewed_diff: &str,
+) -> Result<Option<String>> {
+    let started = Instant::now();
     let title = format!("Fix #{}: {}", ctx.issue_number, ctx.issue_title);
     let body = format!(
         "Closes #{}\n\nGenerated by code-sherpa walking skeleton.",
         ctx.issue_number
     );
+    if options.publish {
+        pr_base_branch(options)?;
+        verify_reviewed_diff_unchanged(ctx, options, reviewed_diff)?;
+    }
     let existing_pr = find_existing_pr(ctx, options)?;
     if options.publish {
         commit_worktree_changes(ctx, options)?;
@@ -709,7 +744,15 @@ fn run_pr_creation(ctx: &PipelineContext, options: &PipelineOptions) -> Result<O
         .context("PrCreation git push failed")?;
 
         if let Some(url) = existing_pr {
-            log_pr_creation(options, ctx, &title, &body, false, Some(&url))
+            log_pr_creation(
+                options,
+                ctx,
+                &title,
+                &body,
+                false,
+                Some(&url),
+                started.elapsed().as_millis(),
+            )
                 .with_context(|| {
                     format!("PrCreation pushed branch for existing PR {url} but failed to write observation log")
                 })?;
@@ -742,14 +785,43 @@ fn run_pr_creation(ctx: &PipelineContext, options: &PipelineOptions) -> Result<O
         if url.is_empty() {
             bail!("PrCreation gh pr create returned empty URL");
         }
-        log_pr_creation(options, ctx, &title, &body, false, Some(&url)).with_context(|| {
+        log_pr_creation(
+            options,
+            ctx,
+            &title,
+            &body,
+            false,
+            Some(&url),
+            started.elapsed().as_millis(),
+        )
+        .with_context(|| {
             format!("PrCreation created PR {url} but failed to write observation log")
         })?;
         return Ok(Some(url));
     }
 
-    log_pr_creation(options, ctx, &title, &body, true, existing_pr.as_deref())?;
+    log_pr_creation(
+        options,
+        ctx,
+        &title,
+        &body,
+        true,
+        existing_pr.as_deref(),
+        started.elapsed().as_millis(),
+    )?;
     Ok(existing_pr)
+}
+
+fn verify_reviewed_diff_unchanged(
+    ctx: &PipelineContext,
+    options: &PipelineOptions,
+    reviewed_diff: &str,
+) -> Result<()> {
+    let current_diff = collect_code_review_diff(ctx, options)?;
+    if current_diff != reviewed_diff {
+        bail!("PrCreation worktree diff changed after CodeReview approval");
+    }
+    Ok(())
 }
 
 fn commit_worktree_changes(ctx: &PipelineContext, options: &PipelineOptions) -> Result<()> {
@@ -828,6 +900,7 @@ fn log_pr_creation(
     body: &str,
     dry_run: bool,
     existing_or_created_url: Option<&str>,
+    duration_ms: u128,
 ) -> Result<()> {
     let push_cmd = vec![
         "git".to_owned(),
@@ -888,28 +961,15 @@ fn log_pr_creation(
             })),
             error: None,
             verdict: None,
+            duration_ms,
         },
     )?;
     Ok(())
 }
 
-fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<ReviewVerdict> {
-    let worktree = Path::new(&ctx.worktree_path);
-    run_cmd(
-        &["git", "add", "--intent-to-add", "."],
-        Some(worktree),
-        options.command_timeout,
-    )
-    .context("CodeReview failed to mark untracked files for diff")?;
-    let diff = run_cmd(
-        &["git", "diff", "--no-ext-diff", &ctx.base_commit],
-        Some(worktree),
-        options.command_timeout,
-    )
-    .context("CodeReview failed to collect worktree diff")?;
-    if diff.trim().is_empty() {
-        bail!("CodeReview collected an empty diff");
-    }
+fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<CodeReviewResult> {
+    let started = Instant::now();
+    let diff = collect_code_review_diff(ctx, options)?;
     let issue_number = ctx.issue_number.to_string();
     let vars = HashMap::from([
         ("issue_number", issue_number.as_str()),
@@ -935,6 +995,7 @@ fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
             output_summary: Some(json!({ "decision": verdict.decision.as_str() })),
             error: None,
             verdict: Some((&raw, &verdict)),
+            duration_ms: started.elapsed().as_millis(),
         },
     ) {
         let reasons = review_reasons(&verdict);
@@ -944,7 +1005,30 @@ fn run_code_review(ctx: &PipelineContext, options: &PipelineOptions) -> Result<R
             reasons
         );
     }
-    Ok(verdict)
+    Ok(CodeReviewResult {
+        verdict,
+        reviewed_diff: diff,
+    })
+}
+
+fn collect_code_review_diff(ctx: &PipelineContext, options: &PipelineOptions) -> Result<String> {
+    let worktree = Path::new(&ctx.worktree_path);
+    run_cmd(
+        &["git", "add", "--intent-to-add", "."],
+        Some(worktree),
+        options.command_timeout,
+    )
+    .context("CodeReview failed to mark untracked files for diff")?;
+    let diff = run_cmd(
+        &["git", "diff", "--no-ext-diff", &ctx.base_commit],
+        Some(worktree),
+        options.command_timeout,
+    )
+    .context("CodeReview failed to collect worktree diff")?;
+    if diff.trim().is_empty() {
+        bail!("CodeReview collected an empty diff");
+    }
+    Ok(diff)
 }
 
 fn resolve_base_commit(options: &PipelineOptions) -> Result<String> {
@@ -1623,11 +1707,19 @@ pub fn parse_agent_output(stdout: &str) -> Result<String> {
     }
 
     if let Some(items) = data.as_array() {
-        let result = items
+        let results = items
             .iter()
-            .rev()
-            .find(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("result"))
-            .ok_or_else(|| anyhow!("claude: missing result event: {}", truncate(stdout, 200)))?;
+            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+            .collect::<Vec<_>>();
+        let result = match results.as_slice() {
+            [] => bail!("claude: missing result event: {}", truncate(stdout, 200)),
+            [result] => *result,
+            _ => bail!(
+                "claude: expected exactly one result event, got {}: {}",
+                results.len(),
+                truncate(stdout, 200)
+            ),
+        };
         return match result.get("result") {
             Some(serde_json::Value::String(s)) => Ok(s.clone()),
             Some(other) => bail!(
