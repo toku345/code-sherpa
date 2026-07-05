@@ -1,12 +1,11 @@
 //! code-sherpa CLI entry point.
 //!
-//! Parses the target issue and prints the planned pipeline. Stage
-//! orchestration (the deterministic state machine) is layered on top of the
-//! primitives in `code_sherpa` and is not implemented yet.
+//! Parses the target issue, resolves the GitHub repository, and starts the
+//! deterministic pipeline walking skeleton.
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use code_sherpa::{PipelineContext, Stage};
+use code_sherpa::{PipelineContext, PipelineOptions, run_pipeline};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,18 +15,35 @@ use std::process::Command;
 struct Cli {
     /// Issue number to drive through the pipeline.
     issue_number: u64,
+
+    /// Push the generated branch and create/reuse a GitHub pull request.
+    #[arg(long)]
+    publish: bool,
+
+    /// Alias for --publish.
+    #[arg(long)]
+    yes: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let ctx = resolve_context(cli.issue_number)?;
+    let repo_root = PathBuf::from(&ctx.worktree_path);
+    let mut options = PipelineOptions::new(&repo_root, repo_root.join("docs/prompts"));
+    options.publish = cli.publish || cli.yes;
 
+    let outcome = run_pipeline(ctx, &options)?;
     eprintln!(
-        "sherpa: issue #{} in {} at {} (pipeline not yet implemented)",
-        ctx.issue_number, ctx.repo, ctx.worktree_path
+        "sherpa: issue #{} in {} completed through code_review (dry_run={})",
+        outcome.context.issue_number, outcome.context.repo, outcome.dry_run
     );
-    eprintln!("stages: {:?}", Stage::ALL.map(|s| s.as_str()));
-    anyhow::bail!("pipeline orchestration is not implemented yet")
+    if let Some(url) = outcome.pr_url {
+        eprintln!("pr: {url}");
+    }
+    if let Some(review) = outcome.code_review {
+        eprintln!("code_review: {:?}", review.decision);
+    }
+    Ok(())
 }
 
 fn resolve_context(issue_number: u64) -> anyhow::Result<PipelineContext> {
